@@ -1,0 +1,44 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model GuildConfig {
+  id               Int      @id @default(autoincrement())
+  guildId          String   @unique
+  panelChannelId   String?
+  ticketCategoryId String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+}
+
+model Ticket {
+  id        Int      @id @default(autoincrement())
+  channelId String   @unique
+  guildId   String
+  ownerId   String
+  subject   String?
+  createdAt DateTime @default(now())
+  claimerId String?
+  closedAt  DateTime?
+  meta      Json?
+}
+
+model Strike {
+  id         Int      @id @default(autoincrement())
+  userId     String
+  guildId    String
+  category   String   // e.g., FLAG_HATE, FLAG_NSFW, FLAG_BET, FLAG_SPAM
+  reason     String?  // short text / description
+  messageId  String?  // message that triggered the strike (if available)
+  actorId    String?  // 'bot' or moderator id if manual
+  createdAt  DateTime @default(now())
+  pardoned   Boolean  @default(false)
+  pardonedAt DateTime?
+  pardonedBy String?
+  meta       Json?
+}
