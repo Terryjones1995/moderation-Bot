@@ -78,20 +78,31 @@ const MODERATION_SYSTEM_PROMPT = `You are a content moderation assistant. Decide
 
 Return exactly one token (FLAG_HATE / FLAG_NSFW / FLAG_BET / FLAG_SPAM / OK). If multiple categories apply, prioritize FLAG_HATE, then FLAG_NSFW, then FLAG_BET, then FLAG_SPAM.`;
 
-// betting/picks keywords
+// betting/picks keywords (expanded to include DM/PM phrasing & common spam variants)
 const BETTING_KEYWORDS = [
   'bet','bets','wager','wagers','gamble','gambles','sportsbook','parlay','parlays','odds','bookie','bookies','betting',
-  'pick','picks','pickem','pick-em','pick em','tip','tips','tipster','sharp','sharpie','juice','edge','prop bet','propbet',
-  'banker','treble','lay','back','spread','moneyline','money line','ml','ou','o/u','over under','ats','pk','multibet','bookmaker'
+  'pick','picks','pickem','pick-em','pick em','pick of the day','pick of the week','free pick','free picks','daily pick','pm for picks',
+  'dm','dms','dm me','dm for picks','dm for picks','dm for pick','dmme','pm','msg','message me','parlay tips','parlaytip','parlay tips',
+  'tip','tips','tipster','sharp','sharpie','juice','edge','prop bet','propbet','banker','treble','lay','back','spread',
+  'moneyline','money line','ml','ou','o/u','over under','ats','pk','multibet','bookmaker','sports picks','sports picks','picks for sale'
 ];
 const BETTING_REGEX = new RegExp(`\\b(${BETTING_KEYWORDS.map(k => k.replace(/[.*+?^${}()|[\\]\\\\]/g,'\\$&')).join('|')})\\b`, 'i');
 
+// NSFW keywords
 const NSFW_KEYWORDS = [
   'porn','pornography','xxx','nsfw','camgirl','cams','nude','nudes','sex','pornhub','xvideos','xhamster','adult','explicit','breast','cock','pussy'
 ];
 const NSFW_REGEX = new RegExp(`\\b(${NSFW_KEYWORDS.map(k => k.replace(/[.*+?^${}()|[\\]\\\\]/g,'\\$&')).join('|')})\\b`, 'i');
 
 const SPAM_LINKS_REGEX = /\bhttps?:\/\/\S+\b/i;
+
+// Hate / racial slur keywords (used for fast prefiltering).
+// NOTE: this list is not exhaustive and is intentionally conservative. OpenAI moderation still used for robust detection.
+const HATE_KEYWORDS = [
+  // very common targeted slur variants (add more as needed)
+  'nigger','nigga','chink','kike','spic','wetback','gook','raghead','honky','faggot','fag','coon','paki','sand nigger','slope'
+];
+const HATE_REGEX = new RegExp(`\\b(${HATE_KEYWORDS.map(k => k.replace(/[.*+?^${}()|[\\]\\\\]/g,'\\$&')).join('|')})\\b`, 'i');
 
 //
 // ---------- ENV & CLIENT ----------
@@ -223,6 +234,7 @@ async function performOpenAICall(content) {
 function shouldCheckByPolicy(content) {
   if (BETTING_REGEX.test(content)) return true;
   if (NSFW_REGEX.test(content)) return true;
+  if (HATE_REGEX.test(content)) return true;
   return Math.random() < SAMPLE_RATE;
 }
 
@@ -283,6 +295,7 @@ async function logDetailed(guild, obj) {
     if (guild) embed.addFields([{ name: 'Guild', value: `${guild.name}`, inline: true }]);
     if (obj.channelName) embed.addFields([{ name: 'Channel', value: `#${String(obj.channelName)}`, inline: true }]);
 
+    // Author display/resolution
     let authorDisplay = obj.userDisplayName || obj.authorTag || 'Unknown';
     let authorMention = obj.authorId ? `<@${obj.authorId}>` : null;
     if (guild && obj.authorId) {
@@ -298,6 +311,7 @@ async function logDetailed(guild, obj) {
     embed.addFields([{ name: 'Author', value: authorFieldValue, inline: true }]);
     embed.addFields([{ name: 'Severity', value: severity.toUpperCase(), inline: true }]);
 
+    // Meta
     const meta = [];
     if (obj.reason) meta.push(`Reason: ${obj.reason}`);
     if (obj.category) meta.push(`Category: ${obj.category}`);
@@ -305,7 +319,24 @@ async function logDetailed(guild, obj) {
     if (obj.check_reason) meta.push(`Precheck: ${obj.check_reason}`);
     if (meta.length > 0) embed.addFields([{ name: 'Meta', value: meta.join('\n'), inline: false }]);
 
-    if (obj.content) embed.setDescription(safeTruncate(String(obj.content), 1024));
+    // Include the flagged message content (truncated) and links when available
+    if (obj.content) {
+      embed.addFields([{ name: 'Message', value: safeTruncate(String(obj.content), 1024), inline: false }]);
+    }
+    // Provide channel and message links where possible (guild only)
+    try {
+      if (guild && obj.channelId) {
+        const channelLink = `https://discord.com/channels/${guild.id}/${obj.channelId}`;
+        embed.addFields([{ name: 'Channel Link', value: channelLink, inline: true }]);
+      }
+      if (guild && obj.channelId && obj.messageId) {
+        const messageLink = `https://discord.com/channels/${guild.id}/${obj.channelId}/${obj.messageId}`;
+        embed.addFields([{ name: 'Message Link', value: messageLink, inline: true }]);
+      }
+    } catch (e) {
+      // ignore link composition problems
+    }
+
     if (obj.authorTag) embed.setFooter({ text: `Tag: ${obj.authorTag}` });
 
     const ch = guild ? logChannels.get(guild.id) : null;
@@ -317,7 +348,11 @@ async function logDetailed(guild, obj) {
     // Keep a concise console JSON for medium+ and also for allowed low-severity important events.
     if (severity !== 'low' || allowDespiteLow) {
       try {
-        console.log(JSON.stringify({ ts: new Date().toISOString(), ...obj }, null, 2));
+        // Include message link & truncated content in console output as well
+        const outObj = { ts: new Date().toISOString(), ...obj };
+        if (obj.channelId && guild) outObj.messageLink = `https://discord.com/channels/${guild.id}/${obj.channelId}/${obj.messageId || ''}`;
+        if (outObj.content) outObj.content = safeTruncate(String(outObj.content), 1200);
+        console.log(JSON.stringify(outObj, null, 2));
       } catch (e) {
         // no-op
       }
@@ -965,18 +1000,20 @@ client.on('messageCreate', async (message) => {
   // quick NSFW prefilter
   const hasAttachment = message.attachments && message.attachments.size > 0;
   const nsfwPrefilter = NSFW_REGEX.test(message.content || '') || (hasAttachment && SPAM_LINKS_REGEX.test(Array.from(message.attachments.values()).map(a => a.url).join(' ')));
+  const hatePrefilter = HATE_REGEX.test(message.content || '');
+  const bettingPrefilter = BETTING_REGEX.test(message.content || '');
 
   const cached = cacheGet(message.content || '');
   if (cached !== null) {
     await logDetailed(guild, { ...baseLog, event: 'cache.hit', reason: 'cache hit', category: cached.category, flagged: cached.flagged });
     if (cached.flagged) {
-      try { await message.delete(); await logDetailed(guild, { ...baseLog, action: 'deleted', reason: `cache_${cached.category}` }); } catch (e) { await logDetailed(guild, { ...baseLog, action: 'delete_failed', note: e?.message || e }); }
+      try { await message.delete(); await logDetailed(guild, { ...baseLog, action: 'deleted', reason: `cache_${cached.category}`, category: cached.category }); } catch (e) { await logDetailed(guild, { ...baseLog, action: 'delete_failed', note: e?.message || e }); }
       try { await message.author.send({ content: CONTENT_DELETED_MESSAGE.replace('{member}', `<@${message.author.id}>`) }); } catch (e) { await logDetailed(guild, { ...baseLog, action: 'dm_failed', note: e?.message || e }); }
     }
     return;
   }
 
-  const reason = (BETTING_REGEX.test(message.content) || nsfwPrefilter || SPAM_LINKS_REGEX.test(message.content)) ? 'keyword_matched' : (Math.random() < SAMPLE_RATE ? 'sampled' : 'skipped_by_sampling');
+  const reason = (bettingPrefilter || nsfwPrefilter || hatePrefilter || SPAM_LINKS_REGEX.test(message.content)) ? 'keyword_matched' : (Math.random() < SAMPLE_RATE ? 'sampled' : 'skipped_by_sampling');
   await logDetailed(guild, { ...baseLog, event: 'precheck', reason });
 
   if (reason === 'skipped_by_sampling') return;
