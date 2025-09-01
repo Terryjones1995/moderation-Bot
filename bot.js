@@ -255,29 +255,31 @@ function computeSeverity(obj) {
   const action = String(obj.action || '').toLowerCase();
   const event = String(obj.event || '').toLowerCase();
 
-  // Highest priority events
+  // Highest priority: hateful content, explicit deletions, quarantine assignment
   if (category === 'FLAG_HATE' || action === 'deleted' || event === 'role.assign.quarantine') return 'high';
 
-  // Medium priority: flagged categories and important events/errors/strikes/tickets
+  // Medium: NSFW, betting, ticket flows, explicit spam detection events (not routine "spam_check.skipped")
+  // Note: avoid using generic 'spam' substring because it matches 'spam_check.skipped' (noisy).
   if (
     category === 'FLAG_NSFW' ||
     category === 'FLAG_BET' ||
-    category === 'FLAG_SPAM' ||
     event.startsWith('ticket.') ||
+    event.includes('spam_detection') ||    // use specific spam_detection marker when you want medium severity
     event.startsWith('strike.') ||
-    event.includes('error')
+    event.startsWith('member.') && action === 'muted'
   ) return 'medium';
 
-  // Everything else is low by default (routine message.* / precheck / openai.call.*)
+  // Default: low severity
   return 'low';
 }
 
 async function logDetailed(guild, obj) {
   try {
     const severity = computeSeverity(obj);
+    // Only log medium+ severity for routine message events.
+    // Still allow logging for important non-message events like errors, setup, ticket flows, role/channel creation, strikes, etc.
     const ev = String(obj.event || '').toLowerCase();
 
-    // Events we still want even if they're "low"
     const allowDespiteLow =
       ev.includes('error') ||
       ev.includes('failed') ||
@@ -291,7 +293,7 @@ async function logDetailed(guild, obj) {
       ev.startsWith('dm.');
 
     if (severity === 'low' && !allowDespiteLow) {
-      // Skip noisy low-severity logs (avoids logging every routine message.received / precheck)
+      // skip noisy low-severity logs (this prevents logging every message.received / precheck etc)
       return;
     }
 
@@ -304,9 +306,12 @@ async function logDetailed(guild, obj) {
       .setColor(color);
 
     if (guild) embed.addFields([{ name: 'Guild', value: `${guild.name}`, inline: true }]);
-    if (obj.channelName) embed.addFields([{ name: 'Channel', value: `#${String(obj.channelName)}`, inline: true }]);
+    if (obj.channelName) {
+      // if a channel id is provided, show the channel name; else show whatever channelName exists
+      embed.addFields([{ name: 'Channel', value: `#${String(obj.channelName)}`, inline: true }]);
+    }
 
-    // Author info (prefer guild member displayName when available)
+    // Author / mention resolution
     let authorDisplay = obj.userDisplayName || obj.authorTag || 'Unknown';
     let authorMention = obj.authorId ? `<@${obj.authorId}>` : null;
     if (guild && obj.authorId) {
@@ -322,7 +327,7 @@ async function logDetailed(guild, obj) {
     embed.addFields([{ name: 'Author', value: authorFieldValue, inline: true }]);
     embed.addFields([{ name: 'Severity', value: severity.toUpperCase(), inline: true }]);
 
-    // Meta
+    // Meta / small notes
     const meta = [];
     if (obj.reason) meta.push(`Reason: ${obj.reason}`);
     if (obj.category) meta.push(`Category: ${obj.category}`);
@@ -330,40 +335,56 @@ async function logDetailed(guild, obj) {
     if (obj.check_reason) meta.push(`Precheck: ${obj.check_reason}`);
     if (meta.length > 0) embed.addFields([{ name: 'Meta', value: meta.join('\n'), inline: false }]);
 
-    // Message content: prefer obj.content, fallback to obj.messageContent
-    const rawMessage = (obj.content ?? obj.messageContent ?? '').toString();
-    if (rawMessage) {
-      // Put a short version in the description (Discord limits)
-      embed.setDescription(safeTruncate(rawMessage, 1024));
+    // Add message content — truncate to keep within embed limits
+    const content = obj.content ? String(obj.content) : '';
+    if (content) {
+      // Put the message text in a field (description tended to be used before; use field to allow adding a jump link separately)
+      embed.addFields([{ name: 'Message', value: safeTruncate(content, 1024), inline: false }]);
     }
+
+    // If a jump link exists, add it as its own field so moderators can click through quickly
+    if (obj.messageLink) {
+      // Make sure embed field doesn't exceed length limits; a markdown link is fine
+      const linkField = `[Jump to message](${String(obj.messageLink)})`;
+      embed.addFields([{ name: 'Message Link', value: safeTruncate(linkField, 1024), inline: false }]);
+    } else if (obj.channelId && obj.messageId) {
+      // Construct a link if channelId + messageId + guild id available (best-effort)
+      try {
+        const guildId = guild ? guild.id : obj.guildId;
+        if (guildId) {
+          const link = `https://discord.com/channels/${guildId}/${obj.channelId}/${obj.messageId}`;
+          embed.addFields([{ name: 'Message Link', value: safeTruncate(`[Jump to message](${link})`, 1024), inline: false }]);
+        }
+      } catch (e) { /* ignore */ }
+    }
+
     if (obj.authorTag) embed.setFooter({ text: `Tag: ${obj.authorTag}` });
 
-    // If we have identifiers, add jump link and an explicit Message field (truncated)
-    // message link format: https://discord.com/channels/<guildId>/<channelId>/<messageId>
-    if (guild && obj.channelId && obj.messageId) {
-      try {
-        const messageLink = `https://discord.com/channels/${guild.id}/${obj.channelId}/${obj.messageId}`;
-        embed.addFields([{ name: 'Message Link', value: `[Jump to message](${messageLink})`, inline: false }]);
-
-        // If description already includes content then this is redundant; but include explicit Message field when truncated
-        if (rawMessage) {
-          embed.addFields([{ name: 'Message (truncated)', value: safeTruncate(rawMessage, 1024), inline: false }]);
-        }
-      } catch (e) {
-        // ignore link building failures — don't fail the whole log
-      }
-    }
-
-    // send to configured mod log channel for guild (if available)
     const ch = guild ? logChannels.get(guild.id) : null;
     if (ch) {
+      // send embed, but guard against send errors
       try { await ch.send({ embeds: [embed] }); } catch (e) { /* ignore send errors to avoid recursive logs */ }
     }
 
     // Keep a concise console JSON for medium+ and also for allowed low-severity important events.
     if (severity !== 'low' || allowDespiteLow) {
       try {
-        console.log(JSON.stringify({ ts: new Date().toISOString(), ...obj }, null, 2));
+        // sanitize before logging to console to avoid huge data
+        const consoleObj = {
+          ts: new Date().toISOString(),
+          event: obj.event,
+          messageId: obj.messageId,
+          authorId: obj.authorId,
+          authorTag: obj.authorTag,
+          channelId: obj.channelId,
+          channelName: obj.channelName,
+          severity,
+          reason: obj.reason,
+          category: obj.category,
+          messageLink: obj.messageLink || null,
+          content: content ? safeTruncate(content, 400) : undefined
+        };
+        console.log(JSON.stringify(consoleObj, null, 2));
       } catch (e) {
         // no-op
       }
@@ -372,6 +393,7 @@ async function logDetailed(guild, obj) {
     console.error('logDetailed error:', e?.message || e);
   }
 }
+
 
 
 //
