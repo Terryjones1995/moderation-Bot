@@ -38,6 +38,7 @@ import {
   ButtonStyle,
   AttachmentBuilder,
 } from 'discord.js';
+
 import OpenAI from 'openai';
 import { PrismaClient } from '@prisma/client';
 
@@ -184,6 +185,8 @@ async function performOpenAICall(content) {
   }
 
   try {
+    // Note: depending on the version of 'openai' package you have, this API shape may vary.
+    // This is the classic `chat.completions.create` call used in some SDK versions.
     const res = await openai.chat.completions.create({
       model: MODEL,
       messages: [
@@ -459,37 +462,41 @@ async function ensureTicketPanel(guild) {
     if (!cfg) {
       // create category & panel
       const ticketCategory = await guild.channels.create({ name: DEFAULT_TICKET_CATEGORY_NAME, type: ChannelType.GuildCategory });
-      const panel = await guild.channels.create({ name: DEFAULT_PANEL_CHANNEL_NAME, type: ChannelType.GuildText, parent: ticketCategory.id });
-      await upsertGuildConfig(guild.id, { panelChannelId: panel.id, ticketCategoryId: ticketCategory.id });
+      const panelCreated = await guild.channels.create({ name: DEFAULT_PANEL_CHANNEL_NAME, type: ChannelType.GuildText, parent: ticketCategory.id });
+      await upsertGuildConfig(guild.id, { panelChannelId: panelCreated.id, ticketCategoryId: ticketCategory.id });
       cfg = await getGuildConfig(guild.id);
       await logDetailed(guild, { event: 'setup.guild_config', note: 'Default ticket panel & category created and saved' });
     }
+
     // send panel message if missing
     const panelId = cfg.panelChannelId;
-const panel = panelId ? await guild.channels.fetch(panelId).catch(() => null) : null;
+    const panel = panelId ? await guild.channels.fetch(panelId).catch(() => null) : null;
 
-// robust check to avoid `panel.isText is not a function` — prefer the method when available,
-// fall back to channel.type or presence of .send()
-const panelIsText = !!panel && (
-  (typeof panel.isText === 'function' ? panel.isText() :
-    (panel.type === ChannelType.GuildText || typeof panel.send === 'function'))
-);
+    // robust check to avoid `panel.isText is not a function` — prefer the method when available,
+    // fall back to channel.type or presence of .send()
+    const panelIsText = !!panel && (
+      (typeof panel.isText === 'function' ? panel.isText() :
+        (panel.type === ChannelType.GuildText || typeof panel.send === 'function'))
+    );
 
-if (panelIsText) {
-  const msgs = await (panel.messages ? panel.messages.fetch({ limit: 50 }).catch(() => null) : null);
-  if (msgs && msgs.some(m => m.author?.id === client.user.id && m.components?.length)) return;
+    if (panelIsText) {
+      const msgs = await (panel.messages ? panel.messages.fetch({ limit: 50 }).catch(() => null) : null);
+      if (msgs && msgs.some(m => m.author?.id === client.user.id && m.components?.length)) return;
 
-  const embed = new EmbedBuilder()
-    .setTitle('Support / Ticket Center')
-    .setDescription('Need help? Click **Open Ticket** to create a private ticket channel where staff can assist you.\nWhen creating a ticket you will be asked for a **subject** and **message**. Mods will be notified.')
-    .setColor(0x3b82f6)
-    .setTimestamp();
-  const button = new ButtonBuilder().setCustomId(TICKET_PANEL_CUSTOM_ID).setLabel('Open Ticket').setStyle(ButtonStyle.Primary);
-  const row = new ActionRowBuilder().addComponents(button);
-  await panel.send({ embeds: [embed], components: [row] });
-  await logDetailed(guild, { event: 'ticket.panel_sent', channelName: panel.name });
+      const embed = new EmbedBuilder()
+        .setTitle('Support / Ticket Center')
+        .setDescription('Need help? Click **Open Ticket** to create a private ticket channel where staff can assist you.\nWhen creating a ticket you will be asked for a **subject** and **message**. Mods will be notified.')
+        .setColor(0x3b82f6)
+        .setTimestamp();
+      const button = new ButtonBuilder().setCustomId(TICKET_PANEL_CUSTOM_ID).setLabel('Open Ticket').setStyle(ButtonStyle.Primary);
+      const row = new ActionRowBuilder().addComponents(button);
+      await panel.send({ embeds: [embed], components: [row] });
+      await logDetailed(guild, { event: 'ticket.panel_sent', channelName: panel.name });
+    }
+  } catch (e) {
+    await logDetailed(guild, { event: 'ticket.panel_failed', note: e?.message || e });
+  }
 }
-
 
 async function createTicketChannel(guild, member, subject, messageBody) {
   try {
