@@ -258,16 +258,11 @@ function computeSeverity(obj) {
   // Highest priority: hateful content, explicit deletions, quarantine assignment
   if (category === 'FLAG_HATE' || action === 'deleted' || event === 'role.assign.quarantine') return 'high';
 
-  // Medium: NSFW, betting, ticket flows, explicit spam detection events (not routine "spam_check.skipped")
-  // Note: avoid using generic 'spam' substring because it matches 'spam_check.skipped' (noisy).
-  if (
-    category === 'FLAG_NSFW' ||
-    category === 'FLAG_BET' ||
-    event.startsWith('ticket.') ||
-    event.includes('spam_detection') ||    // use specific spam_detection marker when you want medium severity
-    event.startsWith('strike.') ||
-    event.startsWith('member.') && action === 'muted'
-  ) return 'medium';
+  // Medium: NSFW, betting, ticket flows, or explicit spam that led to deletion/flagging.
+  // We intentionally avoid treating routine "spam_check.skipped" or similar noisy checks as medium.
+  const spamMedium = (category === 'FLAG_SPAM' && action === 'deleted') || event.includes('spam_detection') || event.includes('spam_flagged');
+
+  if (category === 'FLAG_NSFW' || category === 'FLAG_BET' || event.startsWith('ticket.') || spamMedium) return 'medium';
 
   // Default: low severity
   return 'low';
