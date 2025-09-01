@@ -248,6 +248,27 @@ function computeSeverity(obj) {
 async function logDetailed(guild, obj) {
   try {
     const severity = computeSeverity(obj);
+    // Only log medium+ severity for routine message events.
+    // Still allow logging for important non-message events like errors, setup, ticket flows, role/channel creation, strikes, etc.
+    const ev = String(obj.event || '').toLowerCase();
+
+    const allowDespiteLow =
+      ev.includes('error') ||
+      ev.includes('failed') ||
+      ev.startsWith('ticket.') ||
+      ev.startsWith('setup.') ||
+      ev.startsWith('role.') ||
+      ev.startsWith('channel.') ||
+      ev.startsWith('member.') ||
+      ev.startsWith('strike.') ||
+      ev.startsWith('transcript.') ||
+      ev.startsWith('dm.');
+
+    if (severity === 'low' && !allowDespiteLow) {
+      // skip noisy low-severity logs (this prevents logging every message.received / precheck etc)
+      return;
+    }
+
     const color = severity === 'high' ? 0xE02B2B : (severity === 'medium' ? 0xF59E0B : 0x22C55E);
     const prefix = severity === 'high' ? '⚠️ HIGH PRIORITY — ' : '';
 
@@ -285,8 +306,19 @@ async function logDetailed(guild, obj) {
     if (obj.authorTag) embed.setFooter({ text: `Tag: ${obj.authorTag}` });
 
     const ch = guild ? logChannels.get(guild.id) : null;
-    if (ch) await ch.send({ embeds: [embed] });
-    console.log(JSON.stringify({ ts: new Date().toISOString(), ...obj }, null, 2));
+    if (ch) {
+      // send embed, but guard against send errors
+      try { await ch.send({ embeds: [embed] }); } catch (e) { /* ignore send errors to avoid recursive logs */ }
+    }
+
+    // Keep a concise console JSON for medium+ and also for allowed low-severity important events.
+    if (severity !== 'low' || allowDespiteLow) {
+      try {
+        console.log(JSON.stringify({ ts: new Date().toISOString(), ...obj }, null, 2));
+      } catch (e) {
+        // no-op
+      }
+    }
   } catch (e) {
     console.error('logDetailed error:', e?.message || e);
   }
