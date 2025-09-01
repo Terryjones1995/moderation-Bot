@@ -931,23 +931,36 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
-  // spam checks
-  const arr = addRecentMessage(guild.id, message.author.id, message.content || '<embed/attachment>');
-  if (checkSpam(arr)) {
-    try { await message.delete(); } catch (e) { await logDetailed(guild, { ...baseLog, action: 'delete_failed', note: e?.message || e }); }
-    await logDetailed(guild, { ...baseLog, action: 'deleted', reason: 'spam_detection' });
-    await muteMember(message.member, AUTO_MUTE_MINUTES, 'Auto-mute: spam/flooding');
-    // create strike for spam
-    try {
-      await createStrike({ guildId: guild.id, userId: message.author.id, category: 'FLAG_SPAM', reason: 'spam_detection', messageId: message.id, actorId: 'bot' });
-      const count = await countActiveStrikes(guild.id, message.author.id);
-      await logDetailed(guild, { event: 'strike.recorded', authorId: message.author.id, note: `Strikes now ${count}` });
-      if (count >= PERM_MUTE_THRESHOLD) {
-        await muteMemberForever(message.member, `Reached ${count} strikes (permanent mute)`);
-      }
-    } catch (e) { await logDetailed(guild, { event: 'strike.error', note: e?.message || e }); }
-    return;
+  // spam checks — ignore forum channels & threads to avoid false positives
+  const ch = message.channel;
+  const isForumChannel = ch.type === ChannelType.GuildForum;
+  const isThread = typeof ch.isThread === 'function'
+    ? ch.isThread()
+    : (ch.type === ChannelType.PublicThread || ch.type === ChannelType.PrivateThread || ch.type === ChannelType.AnnouncementThread);
+
+  if (!isForumChannel && !isThread) {
+    const arr = addRecentMessage(guild.id, message.author.id, message.content || '<embed/attachment>');
+    if (checkSpam(arr)) {
+      try { await message.delete(); } catch (e) { await logDetailed(guild, { ...baseLog, action: 'delete_failed', note: e?.message || e }); }
+      await logDetailed(guild, { ...baseLog, action: 'deleted', reason: 'spam_detection' });
+      await muteMember(message.member, AUTO_MUTE_MINUTES, 'Auto-mute: spam/flooding');
+
+      // create strike for spam
+      try {
+        await createStrike({ guildId: guild.id, userId: message.author.id, category: 'FLAG_SPAM', reason: 'spam_detection', messageId: message.id, actorId: 'bot' });
+        const count = await countActiveStrikes(guild.id, message.author.id);
+        await logDetailed(guild, { event: 'strike.recorded', authorId: message.author.id, note: `Strikes now ${count}` });
+        if (count >= PERM_MUTE_THRESHOLD) {
+          await muteMemberForever(message.member, `Reached ${count} strikes (permanent mute)`);
+        }
+      } catch (e) { await logDetailed(guild, { event: 'strike.error', note: e?.message || e }); }
+      return;
+    }
+  } else {
+    // We still want content-based moderation for forum posts/threads, but skip flood/spam auto-mutes.
+    await logDetailed(guild, { ...baseLog, event: 'spam_check.skipped', reason: 'forum_or_thread' });
   }
+
 
   // quick NSFW prefilter
   const hasAttachment = message.attachments && message.attachments.size > 0;
