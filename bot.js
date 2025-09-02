@@ -512,6 +512,8 @@ async function countActiveStrikes(guildId, userId, decayDays = STRIKE_DECAY_DAYS
 //
 const TICKET_PANEL_CUSTOM_ID = 'create_ticket_button_v1';
 const ticketCreationLocks = new Set();
+const ticketLockTimers = new Map();
+const TICKET_LOCK_TTL_MS = 30 * 1000; // 30s safety TTL to prevent stuck locks
 
 function ticketChannelName(member, subject) {
   const base = (member.displayName || member.user.username || 'ticket').toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').slice(0, 20);
@@ -573,6 +575,15 @@ async function createTicketChannel(guild, member, subject, messageBody) {
   }
 
   ticketCreationLocks.add(lockKey);
+  // create a safety TTL in case something crashes before finally block runs
+  if (ticketLockTimers.has(lockKey)) {
+    clearTimeout(ticketLockTimers.get(lockKey));
+  }
+  ticketLockTimers.set(lockKey, setTimeout(() => {
+    ticketCreationLocks.delete(lockKey);
+    ticketLockTimers.delete(lockKey);
+  }, TICKET_LOCK_TTL_MS));
+
   try {
     // check DB for existing open ticket
     const open = await getOpenTicketByOwner(guild.id, member.id);
@@ -643,6 +654,10 @@ async function createTicketChannel(guild, member, subject, messageBody) {
     throw e;
   } finally {
     ticketCreationLocks.delete(lockKey);
+    if (ticketLockTimers.has(lockKey)) {
+      clearTimeout(ticketLockTimers.get(lockKey));
+      ticketLockTimers.delete(lockKey);
+    }
   }
 }
 
@@ -1014,7 +1029,10 @@ async function scanGuildsForQuarantine() {
 //
 // ---------- GUILD EVENTS ----------
 //
-client.once('ready', async () => {
+async function handleClientReady() {
+  if (handleClientReady._handled) return;
+  handleClientReady._handled = true;
+
   console.log(`Logged in as ${client.user.tag}`);
   loadQuarantineMap();
   for (const g of client.guilds.cache.values()) {
@@ -1024,7 +1042,9 @@ client.once('ready', async () => {
   scanGuildsForQuarantine().catch(()=>{});
   // hourly check
   setInterval(scanGuildsForQuarantine, 60 * 60 * 1000);
-});
+}
+client.once('ready', handleClientReady);
+client.once('clientReady', handleClientReady);
 
 client.on('guildCreate', async (guild) => {
   await setupGuild(guild);
@@ -1063,6 +1083,29 @@ client.on('interactionCreate', async (interaction) => {
       const customId = interaction.customId;
 
       if (customId === TICKET_PANEL_CUSTOM_ID) {
+        // Acquire a per-user lock to avoid repeated modals/duplicate submissions
+        const lockKey = `${interaction.guildId || interaction.guild.id}:${interaction.user.id}`;
+        if (ticketCreationLocks.has(lockKey)) {
+          try {
+            if (!interaction.replied && !interaction.deferred) {
+              await interaction.reply({ content: 'Ticket creation already in progress — please finish the open modal or wait a moment.', ephemeral: true });
+            } else {
+              await interaction.followUp({ content: 'Ticket creation already in progress — please finish the open modal or wait a moment.', ephemeral: true });
+            }
+          } catch (e) { /* swallow */ }
+          return;
+        }
+
+        // Acquire lock and set TTL
+        ticketCreationLocks.add(lockKey);
+        if (ticketLockTimers.has(lockKey)) {
+          clearTimeout(ticketLockTimers.get(lockKey));
+        }
+        ticketLockTimers.set(lockKey, setTimeout(() => {
+          ticketCreationLocks.delete(lockKey);
+          ticketLockTimers.delete(lockKey);
+        }, TICKET_LOCK_TTL_MS));
+
         // show modal — wrap in try/catch because showModal can fail with Unknown interaction if it's late or multiple clicks
         const modal = new ModalBuilder()
           .setCustomId(`ticket_modal_${interaction.user.id}_${Date.now()}`)
@@ -1076,7 +1119,12 @@ client.on('interactionCreate', async (interaction) => {
         try {
           await interaction.showModal(modal);
         } catch (err) {
-          // showModal failed (unknown interaction or expired) — fallback to ephemeral reply instructing user
+          // showModal failed (unknown interaction or expired) — release lock & fallback to ephemeral reply instructing user
+          ticketCreationLocks.delete(lockKey);
+          if (ticketLockTimers.has(lockKey)) {
+            clearTimeout(ticketLockTimers.get(lockKey));
+            ticketLockTimers.delete(lockKey);
+          }
           await logDetailed(interaction.guild, { event: 'interaction.modal_failed', reason: 'showModal failed', note: err?.message || err });
           try {
             if (!interaction.replied && !interaction.deferred) {
@@ -1112,6 +1160,20 @@ client.on('interactionCreate', async (interaction) => {
         } catch (e) {
           // sometimes defer fails because interaction acknowledged already — that's ok
           await logDetailed(interaction.guild, { event: 'deferReply.failed', note: e?.message || e });
+        }
+
+        // release the lock acquired at button-click once modal is submitted (defensive)
+        try {
+          const parts = id.split('_'); // ticket_modal_<userId>_<ts>
+          const lockUserId = parts[2];
+          const lockKey = `${interaction.guildId || interaction.guild.id}:${lockUserId}`;
+          ticketCreationLocks.delete(lockKey);
+          if (ticketLockTimers.has(lockKey)) {
+            clearTimeout(ticketLockTimers.get(lockKey));
+            ticketLockTimers.delete(lockKey);
+          }
+        } catch (e) {
+          // ignore parse issues
         }
 
         const subject = interaction.fields.getTextInputValue('ticket_subject').trim();
