@@ -6,6 +6,7 @@
  * - Promise-lock + DB-unique-catch for ticket creation (ticketCreationLocks)
  * - Replace deprecated ephemeral: true with flags: 64
  * - Defensive try/catch around showModal / deferReply / reply/editReply to avoid "Unknown interaction" / "already acknowledged"
+ * - Improved betting detection and moderation prompt to reduce false positives (e.g. "alright bet")
  */
 
 import 'dotenv/config';
@@ -56,23 +57,48 @@ Please note that new Discord accounts (less than ${ACCOUNT_AGE_LIMIT_DAYS} days 
 const ACCOUNT_TOO_NEW_MESSAGE = `Hi {member}, your Discord account is under ${ACCOUNT_AGE_LIMIT_DAYS} days old and cannot send messages here yet. Your message was removed.`;
 const CONTENT_DELETED_MESSAGE = `Hi {member}, your recent message was removed because it violated our community guidelines (hate, gambling, NSFW, or spam).`;
 
-const MODERATION_SYSTEM_PROMPT = `You are a content moderation assistant. Decide whether the user's message contains:
-- hateful content (racism, slurs, targeted harassment) -> return "FLAG_HATE"
-- sports betting/picks/gambling content -> return "FLAG_BET"
-- explicit sexual/NSFW content (pornographic) -> return "FLAG_NSFW"
-- spam/flooding (repetitive messages, solicitations, mass-links) -> return "FLAG_SPAM"
-- none of the above -> return "OK"
+/**
+ * Improved moderation system prompt:
+ * - precise, conservative instructions
+ * - examples to help avoid ambiguous "FLAG" outputs and classify short slang like "bet" as OK
+ */
+const MODERATION_SYSTEM_PROMPT = `
+You are a content moderation assistant. Your job is to examine a single user message and return exactly one token: one of:
+  - FLAG_HATE
+  - FLAG_NSFW
+  - FLAG_BET
+  - FLAG_SPAM
+  - OK
 
-Return exactly one token (FLAG_HATE / FLAG_NSFW / FLAG_BET / FLAG_SPAM / OK). If multiple categories apply, prioritize FLAG_HATE, then FLAG_NSFW, then FLAG_BET, then FLAG_SPAM.`;
+Rules:
+1. Be conservative and precise: only return a FLAG_* token if the message clearly contains activity in that category.
+2. For betting: return FLAG_BET only when the user is clearly offering, requesting, or instructing on placing bets, exchanging betting picks for money, advertising paid picks, discussing odds/money, or requesting/arranging wagering. Single-word affirmations like "bet", "alright bet", "bet!" used as slang for "okay" should be classified as OK.
+3. For hate or sexual content, look for targeted slurs or explicit sexual content respectively.
+4. For spam, look for solicitations, mass-posted links, or clear promotional language.
+5. If the message is ambiguous, return OK (do not return generic "FLAG" without a category).
+6. Output must be exactly one token from the list above, nothing else (no explanation).
 
-const BETTING_KEYWORDS = [
-  'bet','bets','wager','wagers','gamble','gambles','sportsbook','parlay','parlays','odds','bookie','bookies','betting',
-  'pick','picks','pickem','pick-em','pick em','pick of the day','pick of the week','free pick','free picks','daily pick','pm for picks',
-  'dm','dms','dm me','dm for picks','dm for picks','dm for pick','dmme','pm','msg','message me','parlay tips','parlaytip','parlay tips',
-  'tip','tips','tipster','sharp','sharpie','juice','edge','prop bet','propbet','banker','treble','lay','back','spread',
-  'moneyline','money line','ml','ou','o/u','over under','ats','pk','multibet','bookmaker','sports picks','sports picks','picks for sale'
-];
-const BETTING_REGEX = new RegExp(`\\b(${BETTING_KEYWORDS.map(k => k.replace(/[.*+?^${}()|[\\]\\\\]/g,'\\$&')).join('|')})\\b`, 'i');
+Examples (input -> output):
+- "alright bet" -> OK
+- "bet" -> OK
+- "bet $50 on the Lakers -4" -> FLAG_BET
+- "dm me for picks, $20 each" -> FLAG_BET
+- "free picks for sale, dm" -> FLAG_BET
+- "visit https://spam.example to get free coins" -> FLAG_SPAM
+- "you suck, you f***" -> FLAG_HATE
+- "porn link: http://..." -> FLAG_NSFW
+`;
+
+// ----- improved betting detection / affirmation handling -----
+
+// short single-word or short-phrase affirmations we should treat as "OK"
+const AFFIRMATION_REGEX = /^(?:bet|alright bet|bet!|bet\.*|bett+|bet rn|bet bro|bet fam|facts|ok|okie|yep|yup|ya|yah|betty)$/i;
+
+// high-signal betting keywords/phrases that strongly indicate betting activity (dm for picks, selling, parlay, bookie, etc.)
+const BETTING_SIGNAL_REGEX = /\b(?:dm\s+(?:for\s+)?picks|pm\s+(?:for\s+)?picks|dmme\s+for\s+picks|dm\s+for\s+pick|sell(?:ing)?\s+picks|picks\s+for\s+sale|parlay(?:s)?|sportsbook|bookie(?:s)?|parlaytip|parlay\s+tips|tipster|selling\s+picks|dm\s+for\s+picks)\b/i;
+
+// betting numeric/odds patterns that indicate a real bet (amounts, money signs, odds, spreads)
+const BETTING_LIKELY_REGEX = /\b(?:\$\s?\d{1,6}(?:\.\d{1,2})?|\d{1,6}\s?(?:USD|usd|\$|€|£)|moneyline|ml|odds|spread|over|under|o\/u|parlay|vig|juice|\+\d{1,3}|\-\d{1,3})\b/;
 
 const NSFW_KEYWORDS = [
   'porn','pornography','xxx','nsfw','camgirl','cams','nude','nudes','sex','pornhub','xvideos','xhamster','adult','explicit','breast','cock','pussy'
@@ -187,7 +213,7 @@ async function performOpenAICall(content) {
           { role: 'system', content: MODERATION_SYSTEM_PROMPT },
           { role: 'user', content },
         ],
-        max_tokens: 8,
+        max_tokens: 16,
         temperature: 0,
       });
       raw = res.choices?.[0]?.message?.content?.trim?.() || '';
@@ -197,9 +223,10 @@ async function performOpenAICall(content) {
         const r2 = await openai.responses.create({
           model: MODEL,
           input: `${MODERATION_SYSTEM_PROMPT}\n\n${content}`,
-          max_tokens: 8,
+          max_tokens: 16,
         });
-        raw = (r2.output?.[0]?.content?.[0]?.text || '').trim();
+        // SDK shape: r2.output[0].content[0].text or different forms
+        raw = (r2.output?.[0]?.content?.[0]?.text || r2.output?.[0]?.content || '').trim();
       } catch (err2) {
         console.error('OpenAI both API attempts failed:', err2?.message || err2);
         cacheSet(content, false, 'OK');
@@ -213,8 +240,9 @@ async function performOpenAICall(content) {
     else if (out.includes('FLAG_NSFW')) category = 'FLAG_NSFW';
     else if (out.includes('FLAG_BET')) category = 'FLAG_BET';
     else if (out.includes('FLAG_SPAM')) category = 'FLAG_SPAM';
-    else if (out.includes('OK')) category = 'OK';
+    else if (out === 'OK' || out.includes(' OK')) category = 'OK';
     else if (out.includes('FLAG')) {
+      // Unexpected but still suspicious (OpenAI returned 'FLAG' or similar)
       console.warn('OpenAI returned ambiguous FLAG token:', raw);
       category = 'FLAG_SPAM';
     } else {
@@ -232,10 +260,38 @@ async function performOpenAICall(content) {
   }
 }
 
-function shouldCheckByPolicy(content) {
-  if (BETTING_REGEX.test(content)) return true;
-  if (NSFW_REGEX.test(content)) return true;
-  if (HATE_REGEX.test(content)) return true;
+/**
+ * shouldCheckByPolicy
+ * - Uses deterministic heuristics first (affirmation guard, high-signal phrases, numeric money/odds patterns)
+ * - Always check for explicit NSFW/HATE
+ * - Sampling fallback for everything else (reduced in forum channels)
+ */
+function shouldCheckByPolicy(content, channelType = null) {
+  if (!content || !content.trim()) return false;
+  const c = content.trim();
+
+  // 1) VERY fast short-affirmation guard: short one-word "bet" replies are common slang for "ok"
+  if (c.length <= 20 && AFFIRMATION_REGEX.test(c)) return false;
+
+  // 2) High-confidence betting signals -> definitely check
+  if (BETTING_SIGNAL_REGEX.test(c)) return true;
+
+  // 3) Numeric/odds money patterns -> likely betting -> check
+  if (BETTING_LIKELY_REGEX.test(c)) return true;
+
+  // 4) Always check if NSFW/hate obvious keywords match
+  if (NSFW_REGEX.test(c) || HATE_REGEX.test(c)) return true;
+
+  // 5) If message is long enough and contains suspicious link / "dm for" etc.
+  if (c.length > 120 && SPAM_LINKS_REGEX.test(c)) return true;
+
+  // 6) Reduce sampling in forum channels
+  if (channelType === ChannelType.GuildForum) {
+    const forumSampleRate = Math.max(0.001, SAMPLE_RATE / 4);
+    return Math.random() < forumSampleRate;
+  }
+
+  // 7) fallback sampling for general traffic
   return Math.random() < SAMPLE_RATE;
 }
 
@@ -1161,7 +1217,6 @@ client.on('interactionCreate', async (interaction) => {
           if (!interaction.replied && !interaction.deferred) await interaction.reply({ content: `Ticket created: <#${ticketChannel.id}>`, flags: 64 });
           else {
             try { await interaction.editReply({ content: `Ticket created: <#${ticketChannel.id}>` }); } catch (e) {
-              // editReply might fail if interaction was acknowledged a different way; try followUp as last resort
               try { await interaction.followUp({ content: `Ticket created: <#${ticketChannel.id}>`, flags: 64 }); } catch (_) {}
             }
           }
@@ -1302,7 +1357,7 @@ client.on('messageCreate', async (message) => {
   const hasAttachment = message.attachments && message.attachments.size > 0;
   const nsfwPrefilter = NSFW_REGEX.test(message.content || '') || (hasAttachment && SPAM_LINKS_REGEX.test(Array.from(message.attachments.values()).map(a => a.url).join(' ')));
   const hatePrefilter = HATE_REGEX.test(message.content || '');
-  const bettingPrefilter = BETTING_REGEX.test(message.content || '');
+  const bettingPrefilter = BETTING_SIGNAL_REGEX.test(message.content || '') || BETTING_LIKELY_REGEX.test(message.content || '');
 
   const cached = cacheGet(message.content || '');
   if (cached !== null) {
@@ -1314,12 +1369,13 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
+  // Use the improved shouldCheckByPolicy function that incorporates affirmation guard & numeric checks
+  const shouldCheck = shouldCheckByPolicy(message.content || '', message.channel.type);
   let reason;
-  if (isForumChannel) {
-    const forumSampleRate = Math.max(0.001, SAMPLE_RATE / 4);
-    reason = (bettingPrefilter || nsfwPrefilter || hatePrefilter || SPAM_LINKS_REGEX.test(message.content)) ? 'keyword_matched' : (Math.random() < forumSampleRate ? 'sampled_forum' : 'skipped_by_sampling_forum');
+  if (!shouldCheck) {
+    reason = isForumChannel ? 'skipped_by_sampling_forum' : 'skipped_by_sampling';
   } else {
-    reason = (bettingPrefilter || nsfwPrefilter || hatePrefilter || SPAM_LINKS_REGEX.test(message.content)) ? 'keyword_matched' : (Math.random() < SAMPLE_RATE ? 'sampled' : 'skipped_by_sampling');
+    reason = (bettingPrefilter || nsfwPrefilter || hatePrefilter || SPAM_LINKS_REGEX.test(message.content || '')) ? 'keyword_matched' : 'sampled';
   }
   await logDetailed(guild, { ...baseLog, event: 'precheck', reason });
 
