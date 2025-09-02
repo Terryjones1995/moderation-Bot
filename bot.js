@@ -1,10 +1,8 @@
 #!/usr/bin/env node
 /**
  * Full bot.js — Node.js (ESM)
- * - Uses Discord.js v14
- * - Uses OpenAI for moderation (optional)
- * - Persists guild config, tickets, and strikes to Postgres via Prisma
- * - Permanently mutes users when strike threshold met
+ * Updated: improved ticket locking, modal handling, DM backoff queue, quarantine persistence + hourly re-check,
+ *          more robust OpenAI parsing & logging, forum-sampling reduction, safer interaction replies.
  *
  * Requirements:
  *   npm install discord.js openai dotenv @prisma/client prisma
@@ -78,7 +76,6 @@ const MODERATION_SYSTEM_PROMPT = `You are a content moderation assistant. Decide
 
 Return exactly one token (FLAG_HATE / FLAG_NSFW / FLAG_BET / FLAG_SPAM / OK). If multiple categories apply, prioritize FLAG_HATE, then FLAG_NSFW, then FLAG_BET, then FLAG_SPAM.`;
 
-// betting/picks keywords (expanded to include DM/PM phrasing & common spam variants)
 const BETTING_KEYWORDS = [
   'bet','bets','wager','wagers','gamble','gambles','sportsbook','parlay','parlays','odds','bookie','bookies','betting',
   'pick','picks','pickem','pick-em','pick em','pick of the day','pick of the week','free pick','free picks','daily pick','pm for picks',
@@ -88,7 +85,6 @@ const BETTING_KEYWORDS = [
 ];
 const BETTING_REGEX = new RegExp(`\\b(${BETTING_KEYWORDS.map(k => k.replace(/[.*+?^${}()|[\\]\\\\]/g,'\\$&')).join('|')})\\b`, 'i');
 
-// NSFW keywords
 const NSFW_KEYWORDS = [
   'porn','pornography','xxx','nsfw','camgirl','cams','nude','nudes','sex','pornhub','xvideos','xhamster','adult','explicit','breast','cock','pussy'
 ];
@@ -96,10 +92,7 @@ const NSFW_REGEX = new RegExp(`\\b(${NSFW_KEYWORDS.map(k => k.replace(/[.*+?^${}
 
 const SPAM_LINKS_REGEX = /\bhttps?:\/\/\S+\b/i;
 
-// Hate / racial slur keywords (used for fast prefiltering).
-// NOTE: this list is not exhaustive and is intentionally conservative. OpenAI moderation still used for robust detection.
 const HATE_KEYWORDS = [
-  // very common targeted slur variants (add more as needed)
   'nigger','nigga','chink','kike','spic','wetback','gook','raghead','honky','faggot','fag','coon','paki','sand nigger','slope'
 ];
 const HATE_REGEX = new RegExp(`\\b(${HATE_KEYWORDS.map(k => k.replace(/[.*+?^${}()|[\\]\\\\]/g,'\\$&')).join('|')})\\b`, 'i');
@@ -196,28 +189,48 @@ async function performOpenAICall(content) {
   }
 
   try {
-    // Note: depending on the version of 'openai' package you have, this API shape may vary.
-    // This is the classic `chat.completions.create` call used in some SDK versions.
-    const res = await openai.chat.completions.create({
-      model: MODEL,
-      messages: [
-        { role: 'system', content: MODERATION_SYSTEM_PROMPT },
-        { role: 'user', content },
-      ],
-      max_tokens: 1,
-      temperature: 0,
-    });
-    const raw = res.choices?.[0]?.message?.content?.trim?.() || '';
-    const out = raw.toUpperCase();
+    // Try Chat Completions; fall back gracefully if SDK differs
+    let raw = '';
+    try {
+      const res = await openai.chat.completions.create({
+        model: MODEL,
+        messages: [
+          { role: 'system', content: MODERATION_SYSTEM_PROMPT },
+          { role: 'user', content },
+        ],
+        max_tokens: 8,
+        temperature: 0,
+      });
+      raw = res.choices?.[0]?.message?.content?.trim?.() || '';
+    } catch (e) {
+      // some SDKs use openai.chat.completions.create vs openai.responses.create etc.
+      try {
+        const r2 = await openai.responses.create({
+          model: MODEL,
+          input: `${MODERATION_SYSTEM_PROMPT}\n\n${content}`,
+          max_tokens: 8,
+        });
+        raw = (r2.output?.[0]?.content?.[0]?.text || '').trim();
+      } catch (err2) {
+        console.error('OpenAI both API attempts failed:', err2?.message || err2);
+        cacheSet(content, false, 'OK');
+        return { flagged: false, category: 'OK' };
+      }
+    }
 
+    const out = (raw || '').toUpperCase();
     let category = 'OK';
     if (out.includes('FLAG_HATE')) category = 'FLAG_HATE';
     else if (out.includes('FLAG_NSFW')) category = 'FLAG_NSFW';
     else if (out.includes('FLAG_BET')) category = 'FLAG_BET';
     else if (out.includes('FLAG_SPAM')) category = 'FLAG_SPAM';
     else if (out.includes('OK')) category = 'OK';
-    else {
-      console.warn('Unexpected moderation output:', raw);
+    else if (out.includes('FLAG')) {
+      // Unexpected but still suspicious (OpenAI returned 'FLAG' or similar)
+      console.warn('OpenAI returned ambiguous FLAG token:', raw);
+      category = 'FLAG_SPAM';
+    } else {
+      console.warn('Unexpected moderation output (no token recognized):', raw);
       category = 'OK';
     }
 
@@ -255,24 +268,22 @@ function computeSeverity(obj) {
   const action = String(obj.action || '').toLowerCase();
   const event = String(obj.event || '').toLowerCase();
 
-  // Highest priority: hateful content, explicit deletions, quarantine assignment
+  // Higher priority: hateful content, explicit deletions, quarantine assignment
   if (category === 'FLAG_HATE' || action === 'deleted' || event === 'role.assign.quarantine') return 'high';
 
-  // Medium: NSFW, betting, ticket flows, or explicit spam that led to deletion/flagging.
-  // We intentionally avoid treating routine "spam_check.skipped" or similar noisy checks as medium.
+  // Treat OpenAI events as medium to ensure they appear in the log channel (per request)
+  if (event.startsWith('openai.')) return 'medium';
+
   const spamMedium = (category === 'FLAG_SPAM' && action === 'deleted') || event.includes('spam_detection') || event.includes('spam_flagged');
 
   if (category === 'FLAG_NSFW' || category === 'FLAG_BET' || event.startsWith('ticket.') || spamMedium) return 'medium';
 
-  // Default: low severity
   return 'low';
 }
 
 async function logDetailed(guild, obj) {
   try {
     const severity = computeSeverity(obj);
-    // Only log medium+ severity for routine message events.
-    // Still allow logging for important non-message events like errors, setup, ticket flows, role/channel creation, strikes, etc.
     const ev = String(obj.event || '').toLowerCase();
 
     const allowDespiteLow =
@@ -288,7 +299,7 @@ async function logDetailed(guild, obj) {
       ev.startsWith('dm.');
 
     if (severity === 'low' && !allowDespiteLow) {
-      // skip noisy low-severity logs (this prevents logging every message.received / precheck etc)
+      // skip noisy low-severity logs
       return;
     }
 
@@ -302,11 +313,9 @@ async function logDetailed(guild, obj) {
 
     if (guild) embed.addFields([{ name: 'Guild', value: `${guild.name}`, inline: true }]);
     if (obj.channelName) {
-      // if a channel id is provided, show the channel name; else show whatever channelName exists
       embed.addFields([{ name: 'Channel', value: `#${String(obj.channelName)}`, inline: true }]);
     }
 
-    // Author / mention resolution
     let authorDisplay = obj.userDisplayName || obj.authorTag || 'Unknown';
     let authorMention = obj.authorId ? `<@${obj.authorId}>` : null;
     if (guild && obj.authorId) {
@@ -322,7 +331,6 @@ async function logDetailed(guild, obj) {
     embed.addFields([{ name: 'Author', value: authorFieldValue, inline: true }]);
     embed.addFields([{ name: 'Severity', value: severity.toUpperCase(), inline: true }]);
 
-    // Meta / small notes
     const meta = [];
     if (obj.reason) meta.push(`Reason: ${obj.reason}`);
     if (obj.category) meta.push(`Category: ${obj.category}`);
@@ -330,20 +338,15 @@ async function logDetailed(guild, obj) {
     if (obj.check_reason) meta.push(`Precheck: ${obj.check_reason}`);
     if (meta.length > 0) embed.addFields([{ name: 'Meta', value: meta.join('\n'), inline: false }]);
 
-    // Add message content — truncate to keep within embed limits
     const content = obj.content ? String(obj.content) : '';
     if (content) {
-      // Put the message text in a field (description tended to be used before; use field to allow adding a jump link separately)
       embed.addFields([{ name: 'Message', value: safeTruncate(content, 1024), inline: false }]);
     }
 
-    // If a jump link exists, add it as its own field so moderators can click through quickly
     if (obj.messageLink) {
-      // Make sure embed field doesn't exceed length limits; a markdown link is fine
       const linkField = `[Jump to message](${String(obj.messageLink)})`;
       embed.addFields([{ name: 'Message Link', value: safeTruncate(linkField, 1024), inline: false }]);
     } else if (obj.channelId && obj.messageId) {
-      // Construct a link if channelId + messageId + guild id available (best-effort)
       try {
         const guildId = guild ? guild.id : obj.guildId;
         if (guildId) {
@@ -357,14 +360,11 @@ async function logDetailed(guild, obj) {
 
     const ch = guild ? logChannels.get(guild.id) : null;
     if (ch) {
-      // send embed, but guard against send errors
-      try { await ch.send({ embeds: [embed] }); } catch (e) { /* ignore send errors to avoid recursive logs */ }
+      try { await ch.send({ embeds: [embed] }); } catch (e) { /* avoid recursive logs */ }
     }
 
-    // Keep a concise console JSON for medium+ and also for allowed low-severity important events.
     if (severity !== 'low' || allowDespiteLow) {
       try {
-        // sanitize before logging to console to avoid huge data
         const consoleObj = {
           ts: new Date().toISOString(),
           event: obj.event,
@@ -389,8 +389,6 @@ async function logDetailed(guild, obj) {
   }
 }
 
-
-
 //
 // ---------- HELPERS (account age, muted role) ----------
 //
@@ -407,7 +405,6 @@ async function ensureMutedRole(guild) {
   let role = guild.roles.cache.find(r => r.name === MUTED_ROLE_NAME);
   if (!role) {
     role = await guild.roles.create({ name: MUTED_ROLE_NAME, color: 'DarkGrey', reason: 'Muted role for spammers/offenders' });
-    // Best-effort: deny SendMessages in channels where bot can manage perms
     for (const ch of guild.channels.cache.values()) {
       try {
         if (ch.type === ChannelType.GuildText && ch.permissionsFor(guild.members.me).has(PermissionsBitField.Flags.ManageChannels)) {
@@ -473,6 +470,9 @@ async function createTicketRow(obj) {
 async function getTicketRow(channelId) {
   return prisma.ticket.findUnique({ where: { channelId } });
 }
+async function getOpenTicketByOwner(guildId, ownerId) {
+  return prisma.ticket.findFirst({ where: { guildId, ownerId, closedAt: null } });
+}
 async function claimTicketRow(channelId, claimerId) {
   return prisma.ticket.update({ where: { channelId }, data: { claimerId } });
 }
@@ -508,9 +508,10 @@ async function countActiveStrikes(guildId, userId, decayDays = STRIKE_DECAY_DAYS
 }
 
 //
-// ---------- GUILD SETUP & TICKETS (panel) ----------
+// ---------- TICKET HELPERS & LOCKS ----------
 //
 const TICKET_PANEL_CUSTOM_ID = 'create_ticket_button_v1';
+const ticketCreationLocks = new Set();
 
 function ticketChannelName(member, subject) {
   const base = (member.displayName || member.user.username || 'ticket').toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').slice(0, 20);
@@ -522,9 +523,7 @@ function ticketChannelName(member, subject) {
 async function ensureTicketPanel(guild) {
   try {
     let cfg = await getGuildConfig(guild.id);
-    // ensure a ticket category exists and the panel exists
     if (!cfg) {
-      // create category & panel
       const ticketCategory = await guild.channels.create({ name: DEFAULT_TICKET_CATEGORY_NAME, type: ChannelType.GuildCategory });
       const panelCreated = await guild.channels.create({ name: DEFAULT_PANEL_CHANNEL_NAME, type: ChannelType.GuildText, parent: ticketCategory.id });
       await upsertGuildConfig(guild.id, { panelChannelId: panelCreated.id, ticketCategoryId: ticketCategory.id });
@@ -532,12 +531,9 @@ async function ensureTicketPanel(guild) {
       await logDetailed(guild, { event: 'setup.guild_config', note: 'Default ticket panel & category created and saved' });
     }
 
-    // send panel message if missing
     const panelId = cfg.panelChannelId;
     const panel = panelId ? await guild.channels.fetch(panelId).catch(() => null) : null;
 
-    // robust check to avoid `panel.isText is not a function` — prefer the method when available,
-    // fall back to channel.type or presence of .send()
     const panelIsText = !!panel && (
       (typeof panel.isText === 'function' ? panel.isText() :
         (panel.type === ChannelType.GuildText || typeof panel.send === 'function'))
@@ -563,7 +559,34 @@ async function ensureTicketPanel(guild) {
 }
 
 async function createTicketChannel(guild, member, subject, messageBody) {
+  // lock to avoid duplicate creation
+  const lockKey = `${guild.id}:${member.id}`;
+  if (ticketCreationLocks.has(lockKey)) {
+    // another creation in progress — try to find the open ticket and return it
+    const existing = await getOpenTicketByOwner(guild.id, member.id).catch(() => null);
+    if (existing) {
+      const ch = guild.channels.cache.get(existing.channelId);
+      return ch || null;
+    }
+    // don't block forever — continue but log
+    await logDetailed(guild, { event: 'ticket.create_lock_busy', note: `Lock busy for ${lockKey}` });
+  }
+
+  ticketCreationLocks.add(lockKey);
   try {
+    // check DB for existing open ticket
+    const open = await getOpenTicketByOwner(guild.id, member.id);
+    if (open) {
+      const channel = guild.channels.cache.get(open.channelId) || await guild.channels.fetch(open.channelId).catch(()=>null);
+      if (channel) {
+        await logDetailed(guild, { event: 'ticket.open_exists', reason: 'User already has an open ticket', authorId: member.id, channelName: channel.name });
+        return channel;
+      } else {
+        // DB thinks open but channel missing — mark closed to be safe
+        try { await closeTicketRow(open.channelId); } catch {}
+      }
+    }
+
     let cfg = await getGuildConfig(guild.id);
     let category = cfg?.ticketCategoryId ? await guild.channels.fetch(cfg.ticketCategoryId).catch(()=>null) : null;
     if (!category) {
@@ -585,7 +608,7 @@ async function createTicketChannel(guild, member, subject, messageBody) {
       ],
     });
 
-    await createTicketRow({ channelId: channel.id, guildId: guild.id, ownerId: member.id, subject, meta: { createdBy: member.user.tag } });
+    await createTicketRow({ channelId: channel.id, guildId: guild.id, ownerId: member.id, subject, meta: { createdBy: member.user.tag }, createdAt: new Date() });
 
     const headerEmbed = new EmbedBuilder()
       .setTitle(`Ticket: ${subject}`)
@@ -618,6 +641,8 @@ async function createTicketChannel(guild, member, subject, messageBody) {
   } catch (e) {
     await logDetailed(guild, { event: 'ticket.create_failed', note: e?.message || e });
     throw e;
+  } finally {
+    ticketCreationLocks.delete(lockKey);
   }
 }
 
@@ -724,14 +749,12 @@ async function closeTicket(interaction, channelId, closedByMember) {
   // Save transcript first
   await saveTranscriptAndLog(guild, channel, meta);
 
-  // Reply to interaction BEFORE deleting the channel
   const replyText = 'Ticket closed and transcript saved to moderation log.';
   try {
     if (!interaction.replied && !interaction.deferred) await interaction.reply({ content: replyText, flags: 64 });
     else await interaction.followUp({ content: replyText, flags: 64 });
   } catch (e) { console.warn('Failed reply pre-delete', e?.message || e); }
 
-  // Mark ticket closed in DB
   try { await closeTicketRow(channelId); } catch (e) { await logDetailed(guild, { event: 'ticket.close_db_failed', note: e?.message || e }); }
 
   await logDetailed(guild, {
@@ -826,13 +849,181 @@ async function setupGuild(guild) {
 }
 
 //
-// ---------- EVENTS ----------
+// ---------- DM QUEUE (rate-limit safe) ----------
+//
+const dmQueue = [];
+let dmInProgress = false;
+const lastDmToUser = new Map(); // per-user last DM time (ms)
+const DM_BACKOFF_BASE_MS = 800; // base backoff
+
+async function sendDMWithRetries(userOrMember, payload, maxRetries = 5) {
+  // accepts member or user object
+  const id = userOrMember.id || (userOrMember.user && userOrMember.user.id);
+  if (!id) return;
+
+  return new Promise((resolve) => {
+    dmQueue.push({ id, userOrMember, payload, resolve, tries: 0, maxRetries });
+    processDmQueue();
+  });
+}
+
+async function processDmQueue() {
+  if (dmInProgress) return;
+  dmInProgress = true;
+  while (dmQueue.length > 0) {
+    const item = dmQueue.shift();
+    const { userOrMember, payload } = item;
+    const target = userOrMember.user ? userOrMember.user : userOrMember;
+    let tries = 0;
+    while (tries <= item.maxRetries) {
+      try {
+        const now = Date.now();
+        const last = lastDmToUser.get(target.id) || 0;
+        if (now - last < 700) {
+          // small throttle to avoid "opening direct messages too fast."
+          await new Promise((r) => setTimeout(r, 700 - (now - last)));
+        }
+        await target.send(payload);
+        lastDmToUser.set(target.id, Date.now());
+        await logDetailed(null, { event: 'dm.sent', reason: 'DM via queue', authorId: target.id });
+        item.resolve(true);
+        break;
+      } catch (e) {
+        const msg = e?.message || String(e);
+        // detect rate-limit error or "You are opening direct messages too fast"
+        const isRate = msg.includes('You are opening direct messages too fast') || (e?.code === 50007) || (e?.status === 429);
+        tries += 1;
+        if (!isRate || tries > item.maxRetries) {
+          await logDetailed(null, { event: 'dm.failed', reason: 'DM attempt failed', authorId: target.id, note: msg });
+          item.resolve(false);
+          break;
+        }
+        // exponential backoff
+        const backoff = DM_BACKOFF_BASE_MS * Math.pow(2, tries);
+        await new Promise((r) => setTimeout(r, backoff));
+      }
+    }
+    // small global throttle
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  dmInProgress = false;
+}
+
+//
+// ---------- QUARANTINE PERSISTENCE & BACKGROUND JOB ----------
+//
+const QUARANTINE_FILE = path.join(process.cwd(), 'quarantine_map.json');
+let quarantineMap = {}; // { "<guildId>:<userId>": timestampMs }
+
+function loadQuarantineMap() {
+  try {
+    if (fs.existsSync(QUARANTINE_FILE)) {
+      const raw = fs.readFileSync(QUARANTINE_FILE, 'utf8');
+      quarantineMap = JSON.parse(raw || '{}');
+    } else {
+      quarantineMap = {};
+    }
+  } catch (e) {
+    quarantineMap = {};
+  }
+}
+function saveQuarantineMap() {
+  try {
+    fs.writeFileSync(QUARANTINE_FILE, JSON.stringify(quarantineMap), 'utf8');
+  } catch (e) {
+    console.warn('Failed to save quarantine map', e?.message || e);
+  }
+}
+
+function setQuarantineTimestamp(guildId, userId, ts = Date.now()) {
+  quarantineMap[`${guildId}:${userId}`] = ts;
+  saveQuarantineMap();
+}
+function getQuarantineTimestamp(guildId, userId) {
+  return quarantineMap[`${guildId}:${userId}`] || null;
+}
+function clearQuarantineTimestamp(guildId, userId) {
+  delete quarantineMap[`${guildId}:${userId}`];
+  saveQuarantineMap();
+}
+
+async function scanGuildsForQuarantine() {
+  try {
+    for (const guild of client.guilds.cache.values()) {
+      await guild.members.fetch().catch(()=>{});
+      const quarantinedRole = guild.roles.cache.find(r => r.name === QUARANTINED_ROLE_NAME);
+      if (!quarantinedRole) continue;
+
+      // Assign quarantine to new missed members
+      for (const member of guild.members.cache.values()) {
+        if (member.user?.bot) continue;
+        const isQuarantine = member.roles.cache.has(quarantinedRole.id);
+        const isNew = isNewAccount(member.user);
+        if (isNew && !isQuarantine) {
+          try {
+            await member.roles.add(quarantinedRole, 'Periodic quarantine check: account too new');
+            setQuarantineTimestamp(guild.id, member.id, Date.now());
+            await logDetailed(guild, { event: 'role.assign.quarantine', reason: 'Hourly re-check assigned quarantine', authorId: member.id });
+          } catch (e) {
+            await logDetailed(guild, { event: 'role.assign_failed', note: e?.message || e });
+          }
+        }
+        if (isQuarantine && !isNew) {
+          // account matured since assignment
+          try {
+            await member.roles.remove(quarantinedRole, 'Periodic re-check: account aged past limit');
+            clearQuarantineTimestamp(guild.id, member.id);
+            await logDetailed(guild, { event: 'role.remove', roleName: quarantinedRole.name, authorId: member.id });
+          } catch (e) {
+            await logDetailed(guild, { event: 'role.remove_failed', note: e?.message || e });
+          }
+        }
+      }
+
+      // Lift quarantine after 72 hours if present and not flagged
+      for (const key of Object.keys(quarantineMap)) {
+        const [gId, uId] = key.split(':');
+        if (gId !== guild.id) continue;
+        const ts = quarantineMap[key];
+        if (!ts) continue;
+        const age = Date.now() - ts;
+        const SEVENTY_TWO_HOURS = 72 * 60 * 60 * 1000;
+        if (age >= SEVENTY_TWO_HOURS) {
+          // remove quarantine role if member exists and not flagged
+          try {
+            const member = await guild.members.fetch(uId).catch(()=>null);
+            if (member && member.roles.cache.has(quarantinedRole.id)) {
+              // after 72h we remove role (unless later flagged by strikes)
+              await member.roles.remove(quarantinedRole, 'Quarantine period expired (72h) - hourly job');
+              clearQuarantineTimestamp(guild.id, member.id);
+              await logDetailed(guild, { event: 'role.remove', roleName: quarantinedRole.name, authorId: member.id, reason: 'Quarantine expired (72h)' });
+            } else {
+              clearQuarantineTimestamp(guild.id, uId);
+            }
+          } catch (e) {
+            await logDetailed(guild, { event: 'role.remove_failed', note: e?.message || e });
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.error('scanGuildsForQuarantine error', e?.message || e);
+  }
+}
+
+//
+// ---------- GUILD EVENTS ----------
 //
 client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
+  loadQuarantineMap();
   for (const g of client.guilds.cache.values()) {
     await setupGuild(g);
   }
+  // run initial quarantine scan
+  scanGuildsForQuarantine().catch(()=>{});
+  // hourly check
+  setInterval(scanGuildsForQuarantine, 60 * 60 * 1000);
 });
 
 client.on('guildCreate', async (guild) => {
@@ -844,8 +1035,9 @@ client.on('guildMemberAdd', async (member) => {
   await setupGuild(guild).catch(() => {});
   const quarantinedRole = guild.roles.cache.find(r => r.name === QUARANTINED_ROLE_NAME);
 
+  // use DM queue to avoid "opening direct messages too fast"
   try {
-    await member.send({ content: GREETING_MESSAGE.replace('{member}', `<@${member.id}>`) });
+    await sendDMWithRetries(member, { content: GREETING_MESSAGE.replace('{member}', `<@${member.id}>`) });
     await logDetailed(guild, { event: 'dm.sent', reason: 'Greeting DM sent', authorId: member.id, authorTag: member.user.tag, userDisplayName: member.displayName });
   } catch (e) {
     await logDetailed(guild, { event: 'dm.failed', reason: 'Greeting DM failed', authorId: member.id, authorTag: member.user.tag, userDisplayName: member.displayName, note: e?.message || e });
@@ -854,6 +1046,7 @@ client.on('guildMemberAdd', async (member) => {
   if (isNewAccount(member.user) && quarantinedRole) {
     try {
       await member.roles.add(quarantinedRole, 'Account under age limit');
+      setQuarantineTimestamp(guild.id, member.id, Date.now());
       await logDetailed(guild, { event: 'role.assign.quarantine', roleName: quarantinedRole.name, reason: `${QUARANTINED_ROLE_NAME} assigned on join`, authorId: member.id, authorTag: member.user.tag, userDisplayName: member.displayName });
     } catch (e) {
       await logDetailed(guild, { event: 'role.assign_failed', roleName: quarantinedRole ? quarantinedRole.name : QUARANTINED_ROLE_NAME, note: e?.message || e });
@@ -861,12 +1054,16 @@ client.on('guildMemberAdd', async (member) => {
   }
 });
 
+//
+// ---------- INTERACTIONS ----------
+//
 client.on('interactionCreate', async (interaction) => {
   try {
     if (interaction.isButton()) {
       const customId = interaction.customId;
 
       if (customId === TICKET_PANEL_CUSTOM_ID) {
+        // show modal — wrap in try/catch because showModal can fail with Unknown interaction if it's late or multiple clicks
         const modal = new ModalBuilder()
           .setCustomId(`ticket_modal_${interaction.user.id}_${Date.now()}`)
           .setTitle('Open a support ticket');
@@ -875,7 +1072,22 @@ client.on('interactionCreate', async (interaction) => {
         const messageInput = new TextInputBuilder().setCustomId('ticket_message').setLabel('Message').setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(4000);
 
         modal.addComponents(new ActionRowBuilder().addComponents(subjectInput), new ActionRowBuilder().addComponents(messageInput));
-        await interaction.showModal(modal);
+
+        try {
+          await interaction.showModal(modal);
+        } catch (err) {
+          // showModal failed (unknown interaction or expired) — fallback to ephemeral reply instructing user
+          await logDetailed(interaction.guild, { event: 'interaction.modal_failed', reason: 'showModal failed', note: err?.message || err });
+          try {
+            if (!interaction.replied && !interaction.deferred) {
+              await interaction.reply({ content: 'Could not open the ticket modal (interaction expired). Please try the "Open Ticket" button again or DM staff.', ephemeral: true });
+            } else {
+              await interaction.followUp({ content: 'Could not open ticket modal. Please try again later.', ephemeral: true });
+            }
+          } catch (e) {
+            // swallow
+          }
+        }
         return;
       }
 
@@ -894,8 +1106,13 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.isModalSubmit()) {
       const id = interaction.customId || '';
       if (id.startsWith('ticket_modal_')) {
-        // Defer reply immediately to avoid modal UI error
-        try { await interaction.deferReply({ flags: 64 }); } catch (e) { console.warn('deferReply failed:', e?.message || e); }
+        // Defer reply immediately if not yet deferred — avoid double ack
+        try {
+          if (!interaction.deferred && !interaction.replied) await interaction.deferReply({ ephemeral: true });
+        } catch (e) {
+          // sometimes defer fails because interaction acknowledged already — that's ok
+          await logDetailed(interaction.guild, { event: 'deferReply.failed', note: e?.message || e });
+        }
 
         const subject = interaction.fields.getTextInputValue('ticket_subject').trim();
         const messageBody = interaction.fields.getTextInputValue('ticket_message').trim();
@@ -962,6 +1179,7 @@ function checkSpam(arr) {
   return false;
 }
 
+// main message handler
 client.on('messageCreate', async (message) => {
   if (!message.guild || message.author.bot) return;
   const guild = message.guild;
@@ -986,11 +1204,56 @@ client.on('messageCreate', async (message) => {
 
   await logDetailed(guild, { ...baseLog, event: 'message.received', note: 'message received' });
 
+  // QUARANTINED handling: do NOT outright delete messages for quarantined accounts.
+  // For first 72 hours, monitor messages through OpenAI (call it). If flagged -> mute permanently.
   if (isQuarantined) {
-    try { await message.delete(); await logDetailed(guild, { ...baseLog, action: 'deleted', reason: 'quarantined_user' }); } catch (e) { await logDetailed(guild, { ...baseLog, action: 'delete_failed', note: e?.message || e }); }
-    try { await message.author.send({ content: ACCOUNT_TOO_NEW_MESSAGE.replace('{member}', `<@${message.author.id}>`) }); } catch (e) { await logDetailed(guild, { ...baseLog, action: 'dm_failed', note: e?.message || e }); }
-    if (!isNewAccount(message.author) && message.member.roles.cache.has(quarantinedRole.id)) {
-      try { await message.member.roles.remove(quarantinedRole, 'Account aged past limit (runtime check)'); await logDetailed(guild, { event: 'role.remove', roleName: quarantinedRole.name, authorId: message.author.id }); } catch (e) { await logDetailed(guild, { event: 'role.remove_failed', note: e?.message || e }); }
+    const ts = getQuarantineTimestamp(guild.id, message.author.id) || Date.now();
+    const age = Date.now() - ts;
+    const SEVENTY_TWO_HOURS = 72 * 60 * 60 * 1000;
+
+    if (age < SEVENTY_TWO_HOURS) {
+      // Monitor messages via OpenAI instead of deleting immediately
+      await logDetailed(guild, { ...baseLog, event: 'quarantine.monitor', reason: 'Monitoring quarantined user message (72h window)' });
+      const cached = cacheGet(message.content || '');
+      if (cached !== null) {
+        if (cached.flagged) {
+          try { await message.delete(); } catch (e) { await logDetailed(guild, { ...baseLog, action: 'delete_failed', note: e?.message || e }); }
+          await createStrike({ guildId: guild.id, userId: message.author.id, category: cached.category, reason: 'quarantine_auto_flag', messageId: message.id, actorId: 'bot' }).catch(()=>{});
+          await logDetailed(guild, { ...baseLog, action: 'deleted', reason: `cache_${cached.category}`, category: cached.category });
+          try { await message.author.send({ content: `We suspect your account is a bot or violating rules and have taken action: ${cached.category}` }); } catch {}
+          await muteMemberForever(message.member, 'Quarantine: flagged by OpenAI');
+        }
+      } else {
+        // prefer to use queued OpenAI call
+        if (allowOpenAICall()) {
+          try {
+            const res = await performOpenAICall(message.content || '');
+            await logDetailed(guild, { ...baseLog, event: 'openai.call.end', reason: 'Quarantine monitoring', resultCategory: res.category });
+            if (res.flagged) {
+              try { await message.delete(); } catch (e) { await logDetailed(guild, { ...baseLog, action: 'delete_failed', note: e?.message || e }); }
+              await createStrike({ guildId: guild.id, userId: message.author.id, category: res.category, reason: 'quarantine_auto_flag', messageId: message.id, actorId: 'bot' }).catch(()=>{});
+              await logDetailed(guild, { ...baseLog, action: 'deleted', reason: res.category, category: res.category, note: 'Deleted flagged message by AI during quarantine' });
+              try { await message.author.send({ content: `We suspect your account is a bot or violating rules and have taken action: ${res.category}` }); } catch {}
+              await muteMemberForever(message.member, 'Quarantine: flagged by OpenAI');
+            }
+          } catch (e) {
+            await logDetailed(guild, { ...baseLog, event: 'quarantine.openai_error', note: e?.message || e });
+          }
+        } else {
+          await logDetailed(guild, { ...baseLog, event: 'openai.rate_limited', reason: 'OpenAI rate limit - quarantine monitor skipped' });
+        }
+      }
+    } else {
+      // if quarantine older than 72h we allow messages and remove role (hourly job also handles this)
+      try {
+        if (message.member.roles.cache.has(quarantinedRole.id)) {
+          await message.member.roles.remove(quarantinedRole, 'Quarantine expired (real-time check)');
+          clearQuarantineTimestamp(guild.id, message.author.id);
+          await logDetailed(guild, { event: 'role.remove', roleName: quarantinedRole.name, authorId: message.author.id, reason: 'Quarantine expired (message triggered)' });
+        }
+      } catch (e) {
+        await logDetailed(guild, { event: 'role.remove_failed', note: e?.message || e });
+      }
     }
     return;
   }
@@ -1009,7 +1272,6 @@ client.on('messageCreate', async (message) => {
       await logDetailed(guild, { ...baseLog, action: 'deleted', reason: 'spam_detection' });
       await muteMember(message.member, AUTO_MUTE_MINUTES, 'Auto-mute: spam/flooding');
 
-      // create strike for spam
       try {
         await createStrike({ guildId: guild.id, userId: message.author.id, category: 'FLAG_SPAM', reason: 'spam_detection', messageId: message.id, actorId: 'bot' });
         const count = await countActiveStrikes(guild.id, message.author.id);
@@ -1021,10 +1283,8 @@ client.on('messageCreate', async (message) => {
       return;
     }
   } else {
-    // We still want content-based moderation for forum posts/threads, but skip flood/spam auto-mutes.
     await logDetailed(guild, { ...baseLog, event: 'spam_check.skipped', reason: 'forum_or_thread' });
   }
-
 
   // quick NSFW prefilter
   const hasAttachment = message.attachments && message.attachments.size > 0;
@@ -1037,27 +1297,39 @@ client.on('messageCreate', async (message) => {
     await logDetailed(guild, { ...baseLog, event: 'cache.hit', reason: 'cache hit', category: cached.category, flagged: cached.flagged });
     if (cached.flagged) {
       try { await message.delete(); await logDetailed(guild, { ...baseLog, action: 'deleted', reason: `cache_${cached.category}`, category: cached.category }); } catch (e) { await logDetailed(guild, { ...baseLog, action: 'delete_failed', note: e?.message || e }); }
-      try { await message.author.send({ content: CONTENT_DELETED_MESSAGE.replace('{member}', `<@${message.author.id}>`) }); } catch (e) { await logDetailed(guild, { ...baseLog, action: 'dm_failed', note: e?.message || e }); }
+      try { await sendDMWithRetries(message.author, { content: CONTENT_DELETED_MESSAGE.replace('{member}', `<@${message.author.id}>`) }); } catch (e) { await logDetailed(guild, { ...baseLog, action: 'dm_failed', note: e?.message || e }); }
     }
     return;
   }
 
-  const reason = (bettingPrefilter || nsfwPrefilter || hatePrefilter || SPAM_LINKS_REGEX.test(message.content)) ? 'keyword_matched' : (Math.random() < SAMPLE_RATE ? 'sampled' : 'skipped_by_sampling');
+  // Determine reason & sampling logic; reduce sampling in forums
+  let reason;
+  if (isForumChannel) {
+    const forumSampleRate = Math.max(0.001, SAMPLE_RATE / 4); // dramatically reduced
+    reason = (bettingPrefilter || nsfwPrefilter || hatePrefilter || SPAM_LINKS_REGEX.test(message.content)) ? 'keyword_matched' : (Math.random() < forumSampleRate ? 'sampled_forum' : 'skipped_by_sampling_forum');
+  } else {
+    reason = (bettingPrefilter || nsfwPrefilter || hatePrefilter || SPAM_LINKS_REGEX.test(message.content)) ? 'keyword_matched' : (Math.random() < SAMPLE_RATE ? 'sampled' : 'skipped_by_sampling');
+  }
   await logDetailed(guild, { ...baseLog, event: 'precheck', reason });
 
-  if (reason === 'skipped_by_sampling') return;
+  if (reason === 'skipped_by_sampling' || reason === 'skipped_by_sampling_forum') return;
   if (!openai) { await logDetailed(guild, { ...baseLog, event: 'openai.missing', reason: 'OpenAI missing - skip moderation' }); return; }
 
   if (!allowOpenAICall()) { await logDetailed(guild, { ...baseLog, event: 'rate_limit', reason: 'Rate limit reached - skip moderation' }); return; }
 
   try {
     let result = { flagged: false, category: 'OK' };
+
+    // use queue when concurrency is high
     if (activeCalls < CONCURRENCY) {
       activeCalls += 1;
       await logDetailed(guild, { ...baseLog, event: 'openai.call.start', reason: 'Starting OpenAI call', model: MODEL });
-      result = await performOpenAICall(message.content || '');
-      activeCalls -= 1;
-      processQueue();
+      try {
+        result = await performOpenAICall(message.content || '');
+      } finally {
+        activeCalls -= 1;
+        processQueue();
+      }
       await logDetailed(guild, { ...baseLog, event: 'openai.call.end', reason: 'OpenAI call finished', resultCategory: result.category });
     } else {
       await logDetailed(guild, { ...baseLog, event: 'openai.enqueue', reason: 'Enqueuing OpenAI call', queueLength: pendingQueue.length });
@@ -1071,7 +1343,7 @@ client.on('messageCreate', async (message) => {
         await logDetailed(guild, { ...baseLog, action: 'deleted', reason: result.category, category: result.category, note: 'Deleted flagged message by AI' });
       } catch (e) { await logDetailed(guild, { ...baseLog, action: 'delete_failed', note: e?.message || e }); }
 
-      try { await message.author.send({ content: CONTENT_DELETED_MESSAGE.replace('{member}', `<@${message.author.id}>`) }); } catch (e) { await logDetailed(guild, { ...baseLog, action: 'dm_failed', note: e?.message || e }); }
+      try { await sendDMWithRetries(message.author, { content: CONTENT_DELETED_MESSAGE.replace('{member}', `<@${message.author.id}>`) }); } catch (e) { await logDetailed(guild, { ...baseLog, action: 'dm_failed', note: e?.message || e }); }
 
       // create strike
       try {
@@ -1081,7 +1353,6 @@ client.on('messageCreate', async (message) => {
         if (count >= PERM_MUTE_THRESHOLD) {
           await muteMemberForever(message.member, `Reached ${count} strikes (permanent mute)`);
         } else {
-          // progressive action for serious categories
           if (result.category === 'FLAG_HATE' || result.category === 'FLAG_NSFW') {
             await muteMember(message.member, AUTO_MUTE_MINUTES * 3, `Auto-mute: ${result.category}`);
           }
