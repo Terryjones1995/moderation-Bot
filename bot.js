@@ -508,11 +508,13 @@ async function countActiveStrikes(guildId, userId, decayDays = STRIKE_DECAY_DAYS
 }
 
 //
-// ---------- TICKET HELPERS & LOCKS ----------
+// ---------- TICKET HELPERS & LOCKS (UPDATED) ----------
 //
 const TICKET_PANEL_CUSTOM_ID = 'create_ticket_button_v1';
-const ticketCreationLocks = new Set();
-const ticketLockTimers = new Map();
+
+// Promise-based lock map to serialize ticket creation per (guild, user).
+// lockKey -> { promise, resolve, reject, timerId }
+const ticketCreationLocks = new Map();
 const TICKET_LOCK_TTL_MS = 30 * 1000; // 30s safety TTL to prevent stuck locks
 
 function ticketChannelName(member, subject) {
@@ -560,44 +562,59 @@ async function ensureTicketPanel(guild) {
   }
 }
 
+/**
+ * createTicketChannel
+ * - Promise-lock per user to avoid in-process races
+ * - Double-check DB for existing open ticket
+ * - Create channel first (so we have ID), then attempt DB insert
+ * - If DB unique constraint blocks insert, cleanup created channel and return the existing ticket
+ */
 async function createTicketChannel(guild, member, subject, messageBody) {
-  // lock to avoid duplicate creation
   const lockKey = `${guild.id}:${member.id}`;
+
+  // If another creation is in progress for this owner, wait for it to finish.
   if (ticketCreationLocks.has(lockKey)) {
-    // another creation in progress — try to find the open ticket and return it
-    const existing = await getOpenTicketByOwner(guild.id, member.id).catch(() => null);
-    if (existing) {
-      const ch = guild.channels.cache.get(existing.channelId);
-      return ch || null;
+    const lock = ticketCreationLocks.get(lockKey);
+    try { await lock.promise; } catch (_) { /* ignore - still proceed to DB check */ }
+
+    // After waiting, prefer returning the existing open ticket (if any)
+    const existingAfter = await getOpenTicketByOwner(guild.id, member.id).catch(() => null);
+    if (existingAfter && existingAfter.channelId) {
+      const existingCh = guild.channels.cache.get(existingAfter.channelId) || await guild.channels.fetch(existingAfter.channelId).catch(() => null);
+      if (existingCh) return existingCh;
     }
-    // don't block forever — continue but log
-    await logDetailed(guild, { event: 'ticket.create_lock_busy', note: `Lock busy for ${lockKey}` });
+    // else: falling through to attempt creation (rare)
   }
 
-  ticketCreationLocks.add(lockKey);
-  // create a safety TTL in case something crashes before finally block runs
-  if (ticketLockTimers.has(lockKey)) {
-    clearTimeout(ticketLockTimers.get(lockKey));
-  }
-  ticketLockTimers.set(lockKey, setTimeout(() => {
+  // create a lock promise so other callers wait
+  let resolveLock;
+  let rejectLock;
+  const lockObj = {};
+  lockObj.promise = new Promise((res, rej) => { resolveLock = res; rejectLock = rej; });
+  lockObj.resolve = resolveLock;
+  lockObj.reject = rejectLock;
+  // safety TTL to avoid permanent stuck locks
+  lockObj.timerId = setTimeout(() => {
+    try { if (ticketCreationLocks.has(lockKey)) ticketCreationLocks.get(lockKey).resolve(); } catch (_) {}
     ticketCreationLocks.delete(lockKey);
-    ticketLockTimers.delete(lockKey);
-  }, TICKET_LOCK_TTL_MS));
+  }, TICKET_LOCK_TTL_MS);
+  ticketCreationLocks.set(lockKey, lockObj);
 
   try {
-    // check DB for existing open ticket
+    // Re-check DB for existing open ticket (prevents races across processes if DB already has one)
     const open = await getOpenTicketByOwner(guild.id, member.id);
-    if (open) {
+    if (open && open.channelId) {
       const channel = guild.channels.cache.get(open.channelId) || await guild.channels.fetch(open.channelId).catch(()=>null);
       if (channel) {
-        await logDetailed(guild, { event: 'ticket.open_exists', reason: 'User already has an open ticket', authorId: member.id, channelName: channel.name });
+        await logDetailed(guild, { event: 'ticket.open_exists', reason: 'User already has an open ticket (pre-check)', authorId: member.id, channelName: channel.name });
         return channel;
       } else {
         // DB thinks open but channel missing — mark closed to be safe
-        try { await closeTicketRow(open.channelId); } catch {}
+        try { await closeTicketRow(open.channelId); } catch (e) { /* ignore */ }
       }
     }
 
+    // ensure ticket category exists
     let cfg = await getGuildConfig(guild.id);
     let category = cfg?.ticketCategoryId ? await guild.channels.fetch(cfg.ticketCategoryId).catch(()=>null) : null;
     if (!category) {
@@ -607,6 +624,7 @@ async function createTicketChannel(guild, member, subject, messageBody) {
 
     const modRole = guild.roles.cache.find(r => r.name === MODERATOR_ROLE_NAME);
 
+    // create channel first to get channelId (helps if DB insert fails)
     const channel = await guild.channels.create({
       name: ticketChannelName(member, subject),
       type: ChannelType.GuildText,
@@ -619,8 +637,43 @@ async function createTicketChannel(guild, member, subject, messageBody) {
       ],
     });
 
-    await createTicketRow({ channelId: channel.id, guildId: guild.id, ownerId: member.id, subject, meta: { createdBy: member.user.tag }, createdAt: new Date() });
+    // attempt DB insert; if DB has unique index, this may fail
+    try {
+      await createTicketRow({ channelId: channel.id, guildId: guild.id, ownerId: member.id, subject, meta: { createdBy: member.user.tag }, createdAt: new Date() });
+    } catch (dbErr) {
+      // detect unique-constraint / duplicate key errors (Prisma P2002 or Postgres 23505)
+      const isUniqueErr = (dbErr && (dbErr.code === 'P2002' || dbErr.code === '23505' || (dbErr?.meta && Array.isArray(dbErr.meta.target))));
+      if (isUniqueErr) {
+        await logDetailed(guild, { event: 'ticket.db_unique_violation', note: `Unique constraint prevented duplicate ticket for ${member.id}`, authorId: member.id });
 
+        // find the existing open ticket and return it; delete the newly-created channel to avoid orphan channels
+        const existing = await getOpenTicketByOwner(guild.id, member.id).catch(() => null);
+        if (existing && existing.channelId && existing.channelId !== channel.id) {
+          try {
+            // delete the channel we just created (cleanup)
+            await channel.delete('Duplicate ticket created; DB already has open ticket');
+          } catch (delErr) {
+            await logDetailed(guild, { event: 'ticket.channel_delete_failed', note: delErr?.message || delErr });
+          }
+          const existingChannel = guild.channels.cache.get(existing.channelId) || await guild.channels.fetch(existing.channelId).catch(() => null);
+          if (existingChannel) return existingChannel;
+        }
+
+        // If no existing found (weird race), attempt a second insert (best-effort)
+        try {
+          await createTicketRow({ channelId: channel.id, guildId: guild.id, ownerId: member.id, subject, meta: { createdBy: member.user.tag }, createdAt: new Date() });
+        } catch (err2) {
+          // give up on DB; keep the created channel but log the failure
+          await logDetailed(guild, { event: 'ticket.create_after_unique_failed', note: err2?.message || err2 });
+        }
+      } else {
+        // other DB error - bubble up after logging
+        await logDetailed(guild, { event: 'ticket.create_db_error', note: dbErr?.message || dbErr });
+        throw dbErr;
+      }
+    }
+
+    // send header and buttons to channel
     const headerEmbed = new EmbedBuilder()
       .setTitle(`Ticket: ${subject}`)
       .setDescription(`Owner: ${member} — ${member.displayName}\nSubject: ${subject}\n\n${safeTruncate(messageBody, 1000)}`)
@@ -653,10 +706,12 @@ async function createTicketChannel(guild, member, subject, messageBody) {
     await logDetailed(guild, { event: 'ticket.create_failed', note: e?.message || e });
     throw e;
   } finally {
-    ticketCreationLocks.delete(lockKey);
-    if (ticketLockTimers.has(lockKey)) {
-      clearTimeout(ticketLockTimers.get(lockKey));
-      ticketLockTimers.delete(lockKey);
+    // resolve & cleanup lock
+    const lock = ticketCreationLocks.get(lockKey);
+    if (lock) {
+      try { lock.resolve(); } catch (_) { /* ignore */ }
+      if (lock.timerId) clearTimeout(lock.timerId);
+      ticketCreationLocks.delete(lockKey);
     }
   }
 }
@@ -786,6 +841,7 @@ async function closeTicket(interaction, channelId, closedByMember) {
     await logDetailed(guild, { event: 'ticket.delete_failed', note: e?.message || e });
   }
 }
+
 
 //
 // ---------- GUILD SETUP (roles, categories, log channel) ----------
