@@ -7,6 +7,7 @@
  * - Replace deprecated ephemeral: true with flags: 64
  * - Defensive try/catch around showModal / deferReply / reply/editReply to avoid "Unknown interaction" / "already acknowledged"
  * - Improved betting detection and moderation prompt to reduce false positives (e.g. "alright bet")
+ * - NEW: secondary OpenAI verification step for flagged messages to decide whether to record a strike
  */
 
 import 'dotenv/config';
@@ -225,7 +226,6 @@ async function performOpenAICall(content) {
           input: `${MODERATION_SYSTEM_PROMPT}\n\n${content}`,
           max_tokens: 16,
         });
-        // SDK shape: r2.output[0].content[0].text or different forms
         raw = (r2.output?.[0]?.content?.[0]?.text || r2.output?.[0]?.content || '').trim();
       } catch (err2) {
         console.error('OpenAI both API attempts failed:', err2?.message || err2);
@@ -257,6 +257,138 @@ async function performOpenAICall(content) {
     console.error('OpenAI call error:', err?.message || err);
     cacheSet(content, false, 'OK');
     return { flagged: false, category: 'OK' };
+  }
+}
+
+/**
+ * verifyStrikeDecision:
+ * After a message has been flagged by the classifier, ask OpenAI to decide if a formal strike should be recorded.
+ * Returns { strike: boolean, reason: string }.
+ *
+ * Note: This consumes an additional OpenAI call; if rate-limited or OpenAI missing, we fall back to 'strike by default'
+ * (safer for enforcement) but we annotate logs accordingly.
+ */
+async function verifyStrikeDecision(content, category) {
+  if (!openai) return { strike: true, reason: 'verification_unavailable_no_openai' };
+  if (!allowOpenAICall()) return { strike: true, reason: 'verification_unavailable_rate_limited' };
+
+  const systemPrompt = `You are a moderation adjudicator. A classifier labeled a user message as "${category}". Your job: decide whether this message should generate a formal strike under typical community moderation rules. Consider severity, targeted insults, sexual explicitness, solicitations for paid picks, exchange of money, and repeated spam. Be conservative but protective of community safety.
+
+Return EXACTLY two lines:
+First line: STRIKE or NO_STRIKE
+Second line: a single short reason (max 30 words) explaining the decision.
+
+Message:
+<<<
+${content}
+>>>`;
+
+  try {
+    let raw = '';
+    try {
+      const res = await openai.chat.completions.create({
+        model: MODEL,
+        messages: [
+          { role: 'system', content: systemPrompt },
+        ],
+        max_tokens: 60,
+        temperature: 0,
+      });
+      raw = res.choices?.[0]?.message?.content?.trim?.() || '';
+    } catch (e) {
+      try {
+        const r2 = await openai.responses.create({
+          model: MODEL,
+          input: systemPrompt,
+          max_tokens: 60,
+        });
+        raw = (r2.output?.[0]?.content?.[0]?.text || r2.output?.[0]?.content || '').trim();
+      } catch (err2) {
+        console.error('OpenAI verification both API attempts failed:', err2?.message || err2);
+        return { strike: true, reason: 'verification_failed_both_calls' };
+      }
+    }
+
+    // parse response
+    const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    const first = (lines[0] || '').toUpperCase();
+    const second = lines.slice(1).join(' ').slice(0, 200) || 'No reason provided';
+
+    if (first.includes('STRIKE')) return { strike: true, reason: second };
+    if (first.includes('NO_STRIKE')) return { strike: false, reason: second };
+    // if ambiguous, be conservative and strike
+    return { strike: true, reason: `ambiguous_verification_response: ${raw.slice(0,200)}` };
+  } catch (err) {
+    console.error('verifyStrikeDecision error', err?.message || err);
+    return { strike: true, reason: 'verification_exception' };
+  }
+}
+
+/**
+ * decideAndApplyStrike:
+ * Given a flagged message, run verification and conditionally create an entry/penalty.
+ * This centralizes the behavior so we consistently apply verification for all OpenAI-flagged messages.
+ */
+async function decideAndApplyStrike(guild, message, category, baseLog = {}) {
+  try {
+    // attempt verification
+    const verification = await verifyStrikeDecision(message.content || '', category);
+    await logDetailed(guild, { ...baseLog, event: 'openai.verification', reason: verification.reason, category });
+
+    if (verification.strike) {
+      // create strike
+      try {
+        await createStrike({
+          guildId: guild.id,
+          userId: message.author.id,
+          category,
+          reason: `auto-moderation - message flagged (verified)`,
+          messageId: message.id,
+          actorId: 'bot',
+          meta: { verificationReason: verification.reason },
+        });
+        const count = await countActiveStrikes(guild.id, message.author.id);
+        await logDetailed(guild, { event: 'strike.recorded', authorId: message.author.id, note: `Strikes now ${count}`, category, reason: verification.reason });
+        if (count >= PERM_MUTE_THRESHOLD) {
+          await muteMemberForever(message.member, `Reached ${count} strikes (permanent mute)`);
+        } else if (category === 'FLAG_HATE' || category === 'FLAG_NSFW') {
+          await muteMember(message.member, AUTO_MUTE_MINUTES * 3, `Auto-mute: ${category}`);
+        }
+      } catch (e) {
+        await logDetailed(guild, { event: 'strike.create_failed', note: e?.message || e, category });
+      }
+    } else {
+      // verification decided NO_STRIKE -> log and skip strike creation
+      await logDetailed(guild, {
+        event: 'strike.skipped_by_verification',
+        authorId: message.author.id,
+        category,
+        reason: verification.reason,
+        note: 'Message was flagged by classifier but verification step declined to escalate to a strike',
+      });
+    }
+  } catch (e) {
+    // In case verification flow itself fails unexpectedly, default to creating strike (safer)
+    await logDetailed(guild, { event: 'verification_flow_failed', note: e?.message || e, category });
+    try {
+      await createStrike({
+        guildId: guild.id,
+        userId: message.author.id,
+        category,
+        reason: 'auto-moderation - message flagged (verification failed; default strike)',
+        messageId: message.id,
+        actorId: 'bot',
+      });
+      const count = await countActiveStrikes(guild.id, message.author.id);
+      await logDetailed(guild, { event: 'strike.recorded', authorId: message.author.id, note: `Strikes now ${count}`, category });
+      if (count >= PERM_MUTE_THRESHOLD) {
+        await muteMemberForever(message.member, `Reached ${count} strikes (permanent mute)`);
+      } else if (category === 'FLAG_HATE' || category === 'FLAG_NSFW') {
+        await muteMember(message.member, AUTO_MUTE_MINUTES * 3, `Auto-mute: ${category}`);
+      }
+    } catch (err2) {
+      await logDetailed(guild, { event: 'strike.create_failed_after_verif_err', note: err2?.message || err2 });
+    }
   }
 }
 
@@ -1295,9 +1427,11 @@ client.on('messageCreate', async (message) => {
       if (cached !== null) {
         if (cached.flagged) {
           try { await message.delete(); } catch (e) { await logDetailed(guild, { ...baseLog, action: 'delete_failed', note: e?.message || e }); }
-          await createStrike({ guildId: guild.id, userId: message.author.id, category: cached.category, reason: 'quarantine_auto_flag', messageId: message.id, actorId: 'bot' }).catch(()=>{});
+          // run verification before creating a strike
+          await decideAndApplyStrike(guild, message, cached.category, { ...baseLog, event: 'quarantine.auto_flag_cache' });
           await logDetailed(guild, { ...baseLog, action: 'deleted', reason: `cache_${cached.category}`, category: cached.category });
           try { await message.author.send({ content: `We suspect your account is a bot or violating rules and have taken action: ${cached.category}` }); } catch {}
+          // keep permanent mute for quarantine auto-flagging (policy)
           await muteMemberForever(message.member, 'Quarantine: flagged by OpenAI');
         }
       } else {
@@ -1307,7 +1441,7 @@ client.on('messageCreate', async (message) => {
             await logDetailed(guild, { ...baseLog, event: 'openai.call.end', reason: 'Quarantine monitoring', resultCategory: res.category });
             if (res.flagged) {
               try { await message.delete(); } catch (e) { await logDetailed(guild, { ...baseLog, action: 'delete_failed', note: e?.message || e }); }
-              await createStrike({ guildId: guild.id, userId: message.author.id, category: res.category, reason: 'quarantine_auto_flag', messageId: message.id, actorId: 'bot' }).catch(()=>{});
+              await decideAndApplyStrike(guild, message, res.category, { ...baseLog, event: 'quarantine.auto_flag_openai' });
               await logDetailed(guild, { ...baseLog, action: 'deleted', reason: res.category, category: res.category, note: 'Deleted flagged message by AI during quarantine' });
               try { await message.author.send({ content: `We suspect your account is a bot or violating rules and have taken action: ${res.category}` }); } catch {}
               await muteMemberForever(message.member, 'Quarantine: flagged by OpenAI');
@@ -1343,6 +1477,7 @@ client.on('messageCreate', async (message) => {
       await muteMember(message.member, AUTO_MUTE_MINUTES, 'Auto-mute: spam/flooding');
 
       try {
+        // spam detection uses deterministic heuristics -> apply strike immediately (no verification)
         await createStrike({ guildId: guild.id, userId: message.author.id, category: 'FLAG_SPAM', reason: 'spam_detection', messageId: message.id, actorId: 'bot' });
         const count = await countActiveStrikes(guild.id, message.author.id);
         await logDetailed(guild, { event: 'strike.recorded', authorId: message.author.id, note: `Strikes now ${count}` });
@@ -1365,6 +1500,8 @@ client.on('messageCreate', async (message) => {
     if (cached.flagged) {
       try { await message.delete(); await logDetailed(guild, { ...baseLog, action: 'deleted', reason: `cache_${cached.category}`, category: cached.category }); } catch (e) { await logDetailed(guild, { ...baseLog, action: 'delete_failed', note: e?.message || e }); }
       try { await sendDMWithRetries(message.author, { content: CONTENT_DELETED_MESSAGE.replace('{member}', `<@${message.author.id}>`) }); } catch (e) { await logDetailed(guild, { ...baseLog, action: 'dm_failed', note: e?.message || e }); }
+      // decide whether to apply strike based on verification
+      await decideAndApplyStrike(guild, message, cached.category, { ...baseLog, event: 'cache.flagged' });
     }
     return;
   }
@@ -1411,13 +1548,9 @@ client.on('messageCreate', async (message) => {
 
       try { await sendDMWithRetries(message.author, { content: CONTENT_DELETED_MESSAGE.replace('{member}', `<@${message.author.id}>`) }); } catch (e) { await logDetailed(guild, { ...baseLog, action: 'dm_failed', note: e?.message || e }); }
 
-      try {
-        await createStrike({ guildId: guild.id, userId: message.author.id, category: result.category, reason: 'auto-moderation - message flagged', messageId: message.id, actorId: 'bot' });
-        const count = await countActiveStrikes(guild.id, message.author.id);
-        await logDetailed(guild, { event: 'strike.recorded', authorId: message.author.id, note: `Strikes now ${count}` });
-        if (count >= PERM_MUTE_THRESHOLD) await muteMemberForever(message.member, `Reached ${count} strikes (permanent mute)`);
-        else if (result.category === 'FLAG_HATE' || result.category === 'FLAG_NSFW') await muteMember(message.member, AUTO_MUTE_MINUTES * 3, `Auto-mute: ${result.category}`);
-      } catch (e) { await logDetailed(guild, { event: 'strike.error', note: e?.message || e }); }
+      // NEW: verify with OpenAI whether to record a strike for this flagged message
+      await decideAndApplyStrike(guild, message, result.category, { ...baseLog, event: 'auto_flag_openai' });
+
       return;
     } else {
       await logDetailed(guild, { ...baseLog, event: 'message.allowed', reason: 'Message allowed by moderation' });
