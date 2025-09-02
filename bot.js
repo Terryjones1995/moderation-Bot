@@ -1,21 +1,11 @@
 #!/usr/bin/env node
 /**
- * Full bot.js — Node.js (ESM)
- * Updated: improved ticket locking, modal handling, DM backoff queue, quarantine persistence + hourly re-check,
- *          more robust OpenAI parsing & logging, forum-sampling reduction, safer interaction replies.
- *
- * Requirements:
- *   npm install discord.js openai dotenv @prisma/client prisma
- *   npx prisma generate
- *   npx prisma db push
- *
- * Env required:
- *   DATABASE_URL, DISCORD_BOT_TOKEN
- * Optional:
- *   OPENAI_API_KEY
- *   PERM_MUTE_THRESHOLD (default 5)
- *   STRIKE_DECAY_DAYS (default 30)
- *   SAMPLE_RATE, MAX_OPENAI_PER_MIN, CONCURRENCY, CACHE_TTL_MS, MODEL
+ * Consolidated & Updated bot.js
+ * - Interaction dedupe (processedInteractions)
+ * - Safer modal/button locking (ticketModalLocks)
+ * - Promise-lock + DB-unique-catch for ticket creation (ticketCreationLocks)
+ * - Replace deprecated ephemeral: true with flags: 64
+ * - Defensive try/catch around showModal / deferReply / reply/editReply to avoid "Unknown interaction" / "already acknowledged"
  */
 
 import 'dotenv/config';
@@ -36,7 +26,6 @@ import {
   ButtonStyle,
   AttachmentBuilder,
 } from 'discord.js';
-
 import OpenAI from 'openai';
 import { PrismaClient } from '@prisma/client';
 
@@ -203,7 +192,7 @@ async function performOpenAICall(content) {
       });
       raw = res.choices?.[0]?.message?.content?.trim?.() || '';
     } catch (e) {
-      // some SDKs use openai.chat.completions.create vs openai.responses.create etc.
+      // some SDKs use openai.responses.create vs openai.chat.completions
       try {
         const r2 = await openai.responses.create({
           model: MODEL,
@@ -226,7 +215,6 @@ async function performOpenAICall(content) {
     else if (out.includes('FLAG_SPAM')) category = 'FLAG_SPAM';
     else if (out.includes('OK')) category = 'OK';
     else if (out.includes('FLAG')) {
-      // Unexpected but still suspicious (OpenAI returned 'FLAG' or similar)
       console.warn('OpenAI returned ambiguous FLAG token:', raw);
       category = 'FLAG_SPAM';
     } else {
@@ -268,16 +256,10 @@ function computeSeverity(obj) {
   const action = String(obj.action || '').toLowerCase();
   const event = String(obj.event || '').toLowerCase();
 
-  // Higher priority: hateful content, explicit deletions, quarantine assignment
   if (category === 'FLAG_HATE' || action === 'deleted' || event === 'role.assign.quarantine') return 'high';
-
-  // Treat OpenAI events as medium to ensure they appear in the log channel (per request)
   if (event.startsWith('openai.')) return 'medium';
-
   const spamMedium = (category === 'FLAG_SPAM' && action === 'deleted') || event.includes('spam_detection') || event.includes('spam_flagged');
-
   if (category === 'FLAG_NSFW' || category === 'FLAG_BET' || event.startsWith('ticket.') || spamMedium) return 'medium';
-
   return 'low';
 }
 
@@ -299,7 +281,6 @@ async function logDetailed(guild, obj) {
       ev.startsWith('dm.');
 
     if (severity === 'low' && !allowDespiteLow) {
-      // skip noisy low-severity logs
       return;
     }
 
@@ -312,9 +293,7 @@ async function logDetailed(guild, obj) {
       .setColor(color);
 
     if (guild) embed.addFields([{ name: 'Guild', value: `${guild.name}`, inline: true }]);
-    if (obj.channelName) {
-      embed.addFields([{ name: 'Channel', value: `#${String(obj.channelName)}`, inline: true }]);
-    }
+    if (obj.channelName) embed.addFields([{ name: 'Channel', value: `#${String(obj.channelName)}`, inline: true }]);
 
     let authorDisplay = obj.userDisplayName || obj.authorTag || 'Unknown';
     let authorMention = obj.authorId ? `<@${obj.authorId}>` : null;
@@ -339,9 +318,7 @@ async function logDetailed(guild, obj) {
     if (meta.length > 0) embed.addFields([{ name: 'Meta', value: meta.join('\n'), inline: false }]);
 
     const content = obj.content ? String(obj.content) : '';
-    if (content) {
-      embed.addFields([{ name: 'Message', value: safeTruncate(content, 1024), inline: false }]);
-    }
+    if (content) embed.addFields([{ name: 'Message', value: safeTruncate(content, 1024), inline: false }]);
 
     if (obj.messageLink) {
       const linkField = `[Jump to message](${String(obj.messageLink)})`;
@@ -380,9 +357,7 @@ async function logDetailed(guild, obj) {
           content: content ? safeTruncate(content, 400) : undefined
         };
         console.log(JSON.stringify(consoleObj, null, 2));
-      } catch (e) {
-        // no-op
-      }
+      } catch (e) {}
     }
   } catch (e) {
     console.error('logDetailed error:', e?.message || e);
@@ -508,14 +483,22 @@ async function countActiveStrikes(guildId, userId, decayDays = STRIKE_DECAY_DAYS
 }
 
 //
-// ---------- TICKET HELPERS & LOCKS (UPDATED) ----------
+// ---------- TICKET HELPERS & LOCKS ----------
 //
 const TICKET_PANEL_CUSTOM_ID = 'create_ticket_button_v1';
 
-// Promise-based lock map to serialize ticket creation per (guild, user).
-// lockKey -> { promise, resolve, reject, timerId }
+// Interaction dedupe: avoid processing same interaction id twice.
+const processedInteractions = new Set();
+const PROCESSED_INTERACTION_TTL_MS = 60 * 1000; // 60s TTL
+
+// Locking for modal/button display (pre-modal) to prevent multiple modals from same user quickly.
+const ticketModalLocks = new Set();
+const ticketModalTimers = new Map();
+const TICKET_MODAL_LOCK_TTL_MS = 30 * 1000; // 30s
+
+// Promise-based lock map to serialize ticket creation per (guildId:userId)
 const ticketCreationLocks = new Map();
-const TICKET_LOCK_TTL_MS = 30 * 1000; // 30s safety TTL to prevent stuck locks
+const TICKET_CREATION_LOCK_TTL_MS = 30 * 1000; // safety TTL
 
 function ticketChannelName(member, subject) {
   const base = (member.displayName || member.user.username || 'ticket').toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').slice(0, 20);
@@ -563,45 +546,40 @@ async function ensureTicketPanel(guild) {
 }
 
 /**
- * createTicketChannel
- * - Promise-lock per user to avoid in-process races
- * - Double-check DB for existing open ticket
- * - Create channel first (so we have ID), then attempt DB insert
- * - If DB unique constraint blocks insert, cleanup created channel and return the existing ticket
+ * createTicketChannel:
+ * - Promise lock per (guildId:userId) to serialize creation inside process
+ * - Re-check DB before insert
+ * - Create channel first, attempt DB insert; on DB unique violation, cleanup and return existing
  */
 async function createTicketChannel(guild, member, subject, messageBody) {
   const lockKey = `${guild.id}:${member.id}`;
 
-  // If another creation is in progress for this owner, wait for it to finish.
+  // If creation in progress, wait for it to finish and return existing if present
   if (ticketCreationLocks.has(lockKey)) {
-    const lock = ticketCreationLocks.get(lockKey);
-    try { await lock.promise; } catch (_) { /* ignore - still proceed to DB check */ }
-
-    // After waiting, prefer returning the existing open ticket (if any)
+    const existingLock = ticketCreationLocks.get(lockKey);
+    try { await existingLock.promise; } catch (_) {}
     const existingAfter = await getOpenTicketByOwner(guild.id, member.id).catch(() => null);
     if (existingAfter && existingAfter.channelId) {
-      const existingCh = guild.channels.cache.get(existingAfter.channelId) || await guild.channels.fetch(existingAfter.channelId).catch(() => null);
+      const existingCh = guild.channels.cache.get(existingAfter.channelId) || await guild.channels.fetch(existingAfter.channelId).catch(()=>null);
       if (existingCh) return existingCh;
     }
-    // else: falling through to attempt creation (rare)
+    // else continue to try creating (rare)
   }
 
-  // create a lock promise so other callers wait
-  let resolveLock;
-  let rejectLock;
+  // create lock
+  let resolveLock, rejectLock;
   const lockObj = {};
   lockObj.promise = new Promise((res, rej) => { resolveLock = res; rejectLock = rej; });
   lockObj.resolve = resolveLock;
   lockObj.reject = rejectLock;
-  // safety TTL to avoid permanent stuck locks
+  // TTL to avoid stuck lock
   lockObj.timerId = setTimeout(() => {
-    try { if (ticketCreationLocks.has(lockKey)) ticketCreationLocks.get(lockKey).resolve(); } catch (_) {}
+    try { lockObj.resolve(); } catch (_) {}
     ticketCreationLocks.delete(lockKey);
-  }, TICKET_LOCK_TTL_MS);
+  }, TICKET_CREATION_LOCK_TTL_MS);
   ticketCreationLocks.set(lockKey, lockObj);
 
   try {
-    // Re-check DB for existing open ticket (prevents races across processes if DB already has one)
     const open = await getOpenTicketByOwner(guild.id, member.id);
     if (open && open.channelId) {
       const channel = guild.channels.cache.get(open.channelId) || await guild.channels.fetch(open.channelId).catch(()=>null);
@@ -609,12 +587,11 @@ async function createTicketChannel(guild, member, subject, messageBody) {
         await logDetailed(guild, { event: 'ticket.open_exists', reason: 'User already has an open ticket (pre-check)', authorId: member.id, channelName: channel.name });
         return channel;
       } else {
-        // DB thinks open but channel missing — mark closed to be safe
-        try { await closeTicketRow(open.channelId); } catch (e) { /* ignore */ }
+        try { await closeTicketRow(open.channelId); } catch (e) {}
       }
     }
 
-    // ensure ticket category exists
+    // ensure category
     let cfg = await getGuildConfig(guild.id);
     let category = cfg?.ticketCategoryId ? await guild.channels.fetch(cfg.ticketCategoryId).catch(()=>null) : null;
     if (!category) {
@@ -624,7 +601,6 @@ async function createTicketChannel(guild, member, subject, messageBody) {
 
     const modRole = guild.roles.cache.find(r => r.name === MODERATOR_ROLE_NAME);
 
-    // create channel first to get channelId (helps if DB insert fails)
     const channel = await guild.channels.create({
       name: ticketChannelName(member, subject),
       type: ChannelType.GuildText,
@@ -637,43 +613,36 @@ async function createTicketChannel(guild, member, subject, messageBody) {
       ],
     });
 
-    // attempt DB insert; if DB has unique index, this may fail
+    // Try DB insert
     try {
       await createTicketRow({ channelId: channel.id, guildId: guild.id, ownerId: member.id, subject, meta: { createdBy: member.user.tag }, createdAt: new Date() });
     } catch (dbErr) {
-      // detect unique-constraint / duplicate key errors (Prisma P2002 or Postgres 23505)
       const isUniqueErr = (dbErr && (dbErr.code === 'P2002' || dbErr.code === '23505' || (dbErr?.meta && Array.isArray(dbErr.meta.target))));
       if (isUniqueErr) {
         await logDetailed(guild, { event: 'ticket.db_unique_violation', note: `Unique constraint prevented duplicate ticket for ${member.id}`, authorId: member.id });
-
-        // find the existing open ticket and return it; delete the newly-created channel to avoid orphan channels
         const existing = await getOpenTicketByOwner(guild.id, member.id).catch(() => null);
         if (existing && existing.channelId && existing.channelId !== channel.id) {
           try {
-            // delete the channel we just created (cleanup)
             await channel.delete('Duplicate ticket created; DB already has open ticket');
           } catch (delErr) {
             await logDetailed(guild, { event: 'ticket.channel_delete_failed', note: delErr?.message || delErr });
           }
-          const existingChannel = guild.channels.cache.get(existing.channelId) || await guild.channels.fetch(existing.channelId).catch(() => null);
+          const existingChannel = guild.channels.cache.get(existing.channelId) || await guild.channels.fetch(existing.channelId).catch(()=>null);
           if (existingChannel) return existingChannel;
         }
-
-        // If no existing found (weird race), attempt a second insert (best-effort)
+        // if weirdness, try a second insert (best-effort), otherwise keep created channel
         try {
           await createTicketRow({ channelId: channel.id, guildId: guild.id, ownerId: member.id, subject, meta: { createdBy: member.user.tag }, createdAt: new Date() });
         } catch (err2) {
-          // give up on DB; keep the created channel but log the failure
           await logDetailed(guild, { event: 'ticket.create_after_unique_failed', note: err2?.message || err2 });
         }
       } else {
-        // other DB error - bubble up after logging
         await logDetailed(guild, { event: 'ticket.create_db_error', note: dbErr?.message || dbErr });
         throw dbErr;
       }
     }
 
-    // send header and buttons to channel
+    // send header & buttons
     const headerEmbed = new EmbedBuilder()
       .setTitle(`Ticket: ${subject}`)
       .setDescription(`Owner: ${member} — ${member.displayName}\nSubject: ${subject}\n\n${safeTruncate(messageBody, 1000)}`)
@@ -706,10 +675,9 @@ async function createTicketChannel(guild, member, subject, messageBody) {
     await logDetailed(guild, { event: 'ticket.create_failed', note: e?.message || e });
     throw e;
   } finally {
-    // resolve & cleanup lock
     const lock = ticketCreationLocks.get(lockKey);
     if (lock) {
-      try { lock.resolve(); } catch (_) { /* ignore */ }
+      try { lock.resolve(); } catch (_) {}
       if (lock.timerId) clearTimeout(lock.timerId);
       ticketCreationLocks.delete(lockKey);
     }
@@ -842,7 +810,6 @@ async function closeTicket(interaction, channelId, closedByMember) {
   }
 }
 
-
 //
 // ---------- GUILD SETUP (roles, categories, log channel) ----------
 //
@@ -928,10 +895,8 @@ const lastDmToUser = new Map(); // per-user last DM time (ms)
 const DM_BACKOFF_BASE_MS = 800; // base backoff
 
 async function sendDMWithRetries(userOrMember, payload, maxRetries = 5) {
-  // accepts member or user object
   const id = userOrMember.id || (userOrMember.user && userOrMember.user.id);
   if (!id) return;
-
   return new Promise((resolve) => {
     dmQueue.push({ id, userOrMember, payload, resolve, tries: 0, maxRetries });
     processDmQueue();
@@ -950,10 +915,7 @@ async function processDmQueue() {
       try {
         const now = Date.now();
         const last = lastDmToUser.get(target.id) || 0;
-        if (now - last < 700) {
-          // small throttle to avoid "opening direct messages too fast."
-          await new Promise((r) => setTimeout(r, 700 - (now - last)));
-        }
+        if (now - last < 700) await new Promise((r) => setTimeout(r, 700 - (now - last)));
         await target.send(payload);
         lastDmToUser.set(target.id, Date.now());
         await logDetailed(null, { event: 'dm.sent', reason: 'DM via queue', authorId: target.id });
@@ -961,7 +923,6 @@ async function processDmQueue() {
         break;
       } catch (e) {
         const msg = e?.message || String(e);
-        // detect rate-limit error or "You are opening direct messages too fast"
         const isRate = msg.includes('You are opening direct messages too fast') || (e?.code === 50007) || (e?.status === 429);
         tries += 1;
         if (!isRate || tries > item.maxRetries) {
@@ -969,12 +930,10 @@ async function processDmQueue() {
           item.resolve(false);
           break;
         }
-        // exponential backoff
         const backoff = DM_BACKOFF_BASE_MS * Math.pow(2, tries);
         await new Promise((r) => setTimeout(r, backoff));
       }
     }
-    // small global throttle
     await new Promise((r) => setTimeout(r, 250));
   }
   dmInProgress = false;
@@ -991,32 +950,15 @@ function loadQuarantineMap() {
     if (fs.existsSync(QUARANTINE_FILE)) {
       const raw = fs.readFileSync(QUARANTINE_FILE, 'utf8');
       quarantineMap = JSON.parse(raw || '{}');
-    } else {
-      quarantineMap = {};
-    }
-  } catch (e) {
-    quarantineMap = {};
-  }
+    } else quarantineMap = {};
+  } catch (e) { quarantineMap = {}; }
 }
 function saveQuarantineMap() {
-  try {
-    fs.writeFileSync(QUARANTINE_FILE, JSON.stringify(quarantineMap), 'utf8');
-  } catch (e) {
-    console.warn('Failed to save quarantine map', e?.message || e);
-  }
+  try { fs.writeFileSync(QUARANTINE_FILE, JSON.stringify(quarantineMap), 'utf8'); } catch (e) { console.warn('Failed to save quarantine map', e?.message || e); }
 }
-
-function setQuarantineTimestamp(guildId, userId, ts = Date.now()) {
-  quarantineMap[`${guildId}:${userId}`] = ts;
-  saveQuarantineMap();
-}
-function getQuarantineTimestamp(guildId, userId) {
-  return quarantineMap[`${guildId}:${userId}`] || null;
-}
-function clearQuarantineTimestamp(guildId, userId) {
-  delete quarantineMap[`${guildId}:${userId}`];
-  saveQuarantineMap();
-}
+function setQuarantineTimestamp(guildId, userId, ts = Date.now()) { quarantineMap[`${guildId}:${userId}`] = ts; saveQuarantineMap(); }
+function getQuarantineTimestamp(guildId, userId) { return quarantineMap[`${guildId}:${userId}`] || null; }
+function clearQuarantineTimestamp(guildId, userId) { delete quarantineMap[`${guildId}:${userId}`]; saveQuarantineMap(); }
 
 async function scanGuildsForQuarantine() {
   try {
@@ -1024,8 +966,6 @@ async function scanGuildsForQuarantine() {
       await guild.members.fetch().catch(()=>{});
       const quarantinedRole = guild.roles.cache.find(r => r.name === QUARANTINED_ROLE_NAME);
       if (!quarantinedRole) continue;
-
-      // Assign quarantine to new missed members
       for (const member of guild.members.cache.values()) {
         if (member.user?.bot) continue;
         const isQuarantine = member.roles.cache.has(quarantinedRole.id);
@@ -1035,23 +975,17 @@ async function scanGuildsForQuarantine() {
             await member.roles.add(quarantinedRole, 'Periodic quarantine check: account too new');
             setQuarantineTimestamp(guild.id, member.id, Date.now());
             await logDetailed(guild, { event: 'role.assign.quarantine', reason: 'Hourly re-check assigned quarantine', authorId: member.id });
-          } catch (e) {
-            await logDetailed(guild, { event: 'role.assign_failed', note: e?.message || e });
-          }
+          } catch (e) { await logDetailed(guild, { event: 'role.assign_failed', note: e?.message || e }); }
         }
         if (isQuarantine && !isNew) {
-          // account matured since assignment
           try {
             await member.roles.remove(quarantinedRole, 'Periodic re-check: account aged past limit');
             clearQuarantineTimestamp(guild.id, member.id);
             await logDetailed(guild, { event: 'role.remove', roleName: quarantinedRole.name, authorId: member.id });
-          } catch (e) {
-            await logDetailed(guild, { event: 'role.remove_failed', note: e?.message || e });
-          }
+          } catch (e) { await logDetailed(guild, { event: 'role.remove_failed', note: e?.message || e }); }
         }
       }
 
-      // Lift quarantine after 72 hours if present and not flagged
       for (const key of Object.keys(quarantineMap)) {
         const [gId, uId] = key.split(':');
         if (gId !== guild.id) continue;
@@ -1060,26 +994,20 @@ async function scanGuildsForQuarantine() {
         const age = Date.now() - ts;
         const SEVENTY_TWO_HOURS = 72 * 60 * 60 * 1000;
         if (age >= SEVENTY_TWO_HOURS) {
-          // remove quarantine role if member exists and not flagged
           try {
             const member = await guild.members.fetch(uId).catch(()=>null);
             if (member && member.roles.cache.has(quarantinedRole.id)) {
-              // after 72h we remove role (unless later flagged by strikes)
               await member.roles.remove(quarantinedRole, 'Quarantine period expired (72h) - hourly job');
               clearQuarantineTimestamp(guild.id, member.id);
               await logDetailed(guild, { event: 'role.remove', roleName: quarantinedRole.name, authorId: member.id, reason: 'Quarantine expired (72h)' });
             } else {
               clearQuarantineTimestamp(guild.id, uId);
             }
-          } catch (e) {
-            await logDetailed(guild, { event: 'role.remove_failed', note: e?.message || e });
-          }
+          } catch (e) { await logDetailed(guild, { event: 'role.remove_failed', note: e?.message || e }); }
         }
       }
     }
-  } catch (e) {
-    console.error('scanGuildsForQuarantine error', e?.message || e);
-  }
+  } catch (e) { console.error('scanGuildsForQuarantine error', e?.message || e); }
 }
 
 //
@@ -1091,42 +1019,31 @@ async function handleClientReady() {
 
   console.log(`Logged in as ${client.user.tag}`);
   loadQuarantineMap();
-  for (const g of client.guilds.cache.values()) {
-    await setupGuild(g);
-  }
-  // run initial quarantine scan
+  for (const g of client.guilds.cache.values()) await setupGuild(g);
   scanGuildsForQuarantine().catch(()=>{});
-  // hourly check
   setInterval(scanGuildsForQuarantine, 60 * 60 * 1000);
 }
 client.once('ready', handleClientReady);
 client.once('clientReady', handleClientReady);
 
-client.on('guildCreate', async (guild) => {
-  await setupGuild(guild);
-});
+client.on('guildCreate', async (guild) => { await setupGuild(guild); });
 
 client.on('guildMemberAdd', async (member) => {
   const guild = member.guild;
   await setupGuild(guild).catch(() => {});
   const quarantinedRole = guild.roles.cache.find(r => r.name === QUARANTINED_ROLE_NAME);
 
-  // use DM queue to avoid "opening direct messages too fast"
   try {
     await sendDMWithRetries(member, { content: GREETING_MESSAGE.replace('{member}', `<@${member.id}>`) });
     await logDetailed(guild, { event: 'dm.sent', reason: 'Greeting DM sent', authorId: member.id, authorTag: member.user.tag, userDisplayName: member.displayName });
-  } catch (e) {
-    await logDetailed(guild, { event: 'dm.failed', reason: 'Greeting DM failed', authorId: member.id, authorTag: member.user.tag, userDisplayName: member.displayName, note: e?.message || e });
-  }
+  } catch (e) { await logDetailed(guild, { event: 'dm.failed', reason: 'Greeting DM failed', authorId: member.id, authorTag: member.user.tag, userDisplayName: member.displayName, note: e?.message || e }); }
 
   if (isNewAccount(member.user) && quarantinedRole) {
     try {
       await member.roles.add(quarantinedRole, 'Account under age limit');
       setQuarantineTimestamp(guild.id, member.id, Date.now());
       await logDetailed(guild, { event: 'role.assign.quarantine', roleName: quarantinedRole.name, reason: `${QUARANTINED_ROLE_NAME} assigned on join`, authorId: member.id, authorTag: member.user.tag, userDisplayName: member.displayName });
-    } catch (e) {
-      await logDetailed(guild, { event: 'role.assign_failed', roleName: quarantinedRole ? quarantinedRole.name : QUARANTINED_ROLE_NAME, note: e?.message || e });
-    }
+    } catch (e) { await logDetailed(guild, { event: 'role.assign_failed', roleName: quarantinedRole ? quarantinedRole.name : QUARANTINED_ROLE_NAME, note: e?.message || e }); }
   }
 });
 
@@ -1135,34 +1052,34 @@ client.on('guildMemberAdd', async (member) => {
 //
 client.on('interactionCreate', async (interaction) => {
   try {
+    // Dedupe identical interaction deliveries
+    if (processedInteractions.has(interaction.id)) return;
+    processedInteractions.add(interaction.id);
+    setTimeout(() => processedInteractions.delete(interaction.id), PROCESSED_INTERACTION_TTL_MS);
+
     if (interaction.isButton()) {
       const customId = interaction.customId;
 
       if (customId === TICKET_PANEL_CUSTOM_ID) {
-        // Acquire a per-user lock to avoid repeated modals/duplicate submissions
-        const lockKey = `${interaction.guildId || interaction.guild.id}:${interaction.user.id}`;
-        if (ticketCreationLocks.has(lockKey)) {
+        // modal lock key per guild:user
+        const modalLockKey = `${interaction.guildId || interaction.guild.id}:${interaction.user.id}`;
+        if (ticketModalLocks.has(modalLockKey)) {
           try {
-            if (!interaction.replied && !interaction.deferred) {
-              await interaction.reply({ content: 'Ticket creation already in progress — please finish the open modal or wait a moment.', ephemeral: true });
-            } else {
-              await interaction.followUp({ content: 'Ticket creation already in progress — please finish the open modal or wait a moment.', ephemeral: true });
-            }
-          } catch (e) { /* swallow */ }
+            if (!interaction.replied && !interaction.deferred) await interaction.reply({ content: 'Ticket creation already in progress — please finish the open modal or wait a moment.', flags: 64 });
+            else await interaction.followUp({ content: 'Ticket creation already in progress — please finish the open modal or wait a moment.', flags: 64 });
+          } catch (e) {}
           return;
         }
 
-        // Acquire lock and set TTL
-        ticketCreationLocks.add(lockKey);
-        if (ticketLockTimers.has(lockKey)) {
-          clearTimeout(ticketLockTimers.get(lockKey));
-        }
-        ticketLockTimers.set(lockKey, setTimeout(() => {
-          ticketCreationLocks.delete(lockKey);
-          ticketLockTimers.delete(lockKey);
-        }, TICKET_LOCK_TTL_MS));
+        // set modal lock & TTL
+        ticketModalLocks.add(modalLockKey);
+        if (ticketModalTimers.has(modalLockKey)) clearTimeout(ticketModalTimers.get(modalLockKey));
+        ticketModalTimers.set(modalLockKey, setTimeout(() => {
+          ticketModalLocks.delete(modalLockKey);
+          ticketModalTimers.delete(modalLockKey);
+        }, TICKET_MODAL_LOCK_TTL_MS));
 
-        // show modal — wrap in try/catch because showModal can fail with Unknown interaction if it's late or multiple clicks
+        // build modal
         const modal = new ModalBuilder()
           .setCustomId(`ticket_modal_${interaction.user.id}_${Date.now()}`)
           .setTitle('Open a support ticket');
@@ -1175,22 +1092,14 @@ client.on('interactionCreate', async (interaction) => {
         try {
           await interaction.showModal(modal);
         } catch (err) {
-          // showModal failed (unknown interaction or expired) — release lock & fallback to ephemeral reply instructing user
-          ticketCreationLocks.delete(lockKey);
-          if (ticketLockTimers.has(lockKey)) {
-            clearTimeout(ticketLockTimers.get(lockKey));
-            ticketLockTimers.delete(lockKey);
-          }
+          // release lock
+          ticketModalLocks.delete(modalLockKey);
+          if (ticketModalTimers.has(modalLockKey)) { clearTimeout(ticketModalTimers.get(modalLockKey)); ticketModalTimers.delete(modalLockKey); }
           await logDetailed(interaction.guild, { event: 'interaction.modal_failed', reason: 'showModal failed', note: err?.message || err });
           try {
-            if (!interaction.replied && !interaction.deferred) {
-              await interaction.reply({ content: 'Could not open the ticket modal (interaction expired). Please try the "Open Ticket" button again or DM staff.', ephemeral: true });
-            } else {
-              await interaction.followUp({ content: 'Could not open ticket modal. Please try again later.', ephemeral: true });
-            }
-          } catch (e) {
-            // swallow
-          }
+            if (!interaction.replied && !interaction.deferred) await interaction.reply({ content: 'Could not open the ticket modal (interaction expired). Please try the "Open Ticket" button again or DM staff.', flags: 64 });
+            else await interaction.followUp({ content: 'Could not open ticket modal. Please try again later.', flags: 64 });
+          } catch (e) {}
         }
         return;
       }
@@ -1210,27 +1119,21 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.isModalSubmit()) {
       const id = interaction.customId || '';
       if (id.startsWith('ticket_modal_')) {
-        // Defer reply immediately if not yet deferred — avoid double ack
+        // Defer reply if we can: use flags instead of ephemeral option
         try {
-          if (!interaction.deferred && !interaction.replied) await interaction.deferReply({ ephemeral: true });
+          if (!interaction.deferred && !interaction.replied) await interaction.deferReply({ flags: 64 });
         } catch (e) {
-          // sometimes defer fails because interaction acknowledged already — that's ok
           await logDetailed(interaction.guild, { event: 'deferReply.failed', note: e?.message || e });
         }
 
-        // release the lock acquired at button-click once modal is submitted (defensive)
+        // release the earlier modal lock
         try {
           const parts = id.split('_'); // ticket_modal_<userId>_<ts>
           const lockUserId = parts[2];
           const lockKey = `${interaction.guildId || interaction.guild.id}:${lockUserId}`;
-          ticketCreationLocks.delete(lockKey);
-          if (ticketLockTimers.has(lockKey)) {
-            clearTimeout(ticketLockTimers.get(lockKey));
-            ticketLockTimers.delete(lockKey);
-          }
-        } catch (e) {
-          // ignore parse issues
-        }
+          ticketModalLocks.delete(lockKey);
+          if (ticketModalTimers.has(lockKey)) { clearTimeout(ticketModalTimers.get(lockKey)); ticketModalTimers.delete(lockKey); }
+        } catch (e) {}
 
         const subject = interaction.fields.getTextInputValue('ticket_subject').trim();
         const messageBody = interaction.fields.getTextInputValue('ticket_message').trim();
@@ -1256,7 +1159,12 @@ client.on('interactionCreate', async (interaction) => {
 
         try {
           if (!interaction.replied && !interaction.deferred) await interaction.reply({ content: `Ticket created: <#${ticketChannel.id}>`, flags: 64 });
-          else await interaction.editReply({ content: `Ticket created: <#${ticketChannel.id}>` });
+          else {
+            try { await interaction.editReply({ content: `Ticket created: <#${ticketChannel.id}>` }); } catch (e) {
+              // editReply might fail if interaction was acknowledged a different way; try followUp as last resort
+              try { await interaction.followUp({ content: `Ticket created: <#${ticketChannel.id}>`, flags: 64 }); } catch (_) {}
+            }
+          }
         } catch (e) {
           console.warn('Failed to confirm ticket creation reply:', e?.message || e);
         }
@@ -1297,7 +1205,6 @@ function checkSpam(arr) {
   return false;
 }
 
-// main message handler
 client.on('messageCreate', async (message) => {
   if (!message.guild || message.author.bot) return;
   const guild = message.guild;
@@ -1322,15 +1229,12 @@ client.on('messageCreate', async (message) => {
 
   await logDetailed(guild, { ...baseLog, event: 'message.received', note: 'message received' });
 
-  // QUARANTINED handling: do NOT outright delete messages for quarantined accounts.
-  // For first 72 hours, monitor messages through OpenAI (call it). If flagged -> mute permanently.
   if (isQuarantined) {
     const ts = getQuarantineTimestamp(guild.id, message.author.id) || Date.now();
     const age = Date.now() - ts;
     const SEVENTY_TWO_HOURS = 72 * 60 * 60 * 1000;
 
     if (age < SEVENTY_TWO_HOURS) {
-      // Monitor messages via OpenAI instead of deleting immediately
       await logDetailed(guild, { ...baseLog, event: 'quarantine.monitor', reason: 'Monitoring quarantined user message (72h window)' });
       const cached = cacheGet(message.content || '');
       if (cached !== null) {
@@ -1342,7 +1246,6 @@ client.on('messageCreate', async (message) => {
           await muteMemberForever(message.member, 'Quarantine: flagged by OpenAI');
         }
       } else {
-        // prefer to use queued OpenAI call
         if (allowOpenAICall()) {
           try {
             const res = await performOpenAICall(message.content || '');
@@ -1362,26 +1265,20 @@ client.on('messageCreate', async (message) => {
         }
       }
     } else {
-      // if quarantine older than 72h we allow messages and remove role (hourly job also handles this)
       try {
         if (message.member.roles.cache.has(quarantinedRole.id)) {
           await message.member.roles.remove(quarantinedRole, 'Quarantine expired (real-time check)');
           clearQuarantineTimestamp(guild.id, message.author.id);
           await logDetailed(guild, { event: 'role.remove', roleName: quarantinedRole.name, authorId: message.author.id, reason: 'Quarantine expired (message triggered)' });
         }
-      } catch (e) {
-        await logDetailed(guild, { event: 'role.remove_failed', note: e?.message || e });
-      }
+      } catch (e) { await logDetailed(guild, { event: 'role.remove_failed', note: e?.message || e }); }
     }
     return;
   }
 
-  // spam checks — ignore forum channels & threads to avoid false positives
   const ch = message.channel;
   const isForumChannel = ch.type === ChannelType.GuildForum;
-  const isThread = typeof ch.isThread === 'function'
-    ? ch.isThread()
-    : (ch.type === ChannelType.PublicThread || ch.type === ChannelType.PrivateThread || ch.type === ChannelType.AnnouncementThread);
+  const isThread = typeof ch.isThread === 'function' ? ch.isThread() : (ch.type === ChannelType.PublicThread || ch.type === ChannelType.PrivateThread || ch.type === ChannelType.AnnouncementThread);
 
   if (!isForumChannel && !isThread) {
     const arr = addRecentMessage(guild.id, message.author.id, message.content || '<embed/attachment>');
@@ -1394,9 +1291,7 @@ client.on('messageCreate', async (message) => {
         await createStrike({ guildId: guild.id, userId: message.author.id, category: 'FLAG_SPAM', reason: 'spam_detection', messageId: message.id, actorId: 'bot' });
         const count = await countActiveStrikes(guild.id, message.author.id);
         await logDetailed(guild, { event: 'strike.recorded', authorId: message.author.id, note: `Strikes now ${count}` });
-        if (count >= PERM_MUTE_THRESHOLD) {
-          await muteMemberForever(message.member, `Reached ${count} strikes (permanent mute)`);
-        }
+        if (count >= PERM_MUTE_THRESHOLD) await muteMemberForever(message.member, `Reached ${count} strikes (permanent mute)`);
       } catch (e) { await logDetailed(guild, { event: 'strike.error', note: e?.message || e }); }
       return;
     }
@@ -1404,7 +1299,6 @@ client.on('messageCreate', async (message) => {
     await logDetailed(guild, { ...baseLog, event: 'spam_check.skipped', reason: 'forum_or_thread' });
   }
 
-  // quick NSFW prefilter
   const hasAttachment = message.attachments && message.attachments.size > 0;
   const nsfwPrefilter = NSFW_REGEX.test(message.content || '') || (hasAttachment && SPAM_LINKS_REGEX.test(Array.from(message.attachments.values()).map(a => a.url).join(' ')));
   const hatePrefilter = HATE_REGEX.test(message.content || '');
@@ -1420,10 +1314,9 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
-  // Determine reason & sampling logic; reduce sampling in forums
   let reason;
   if (isForumChannel) {
-    const forumSampleRate = Math.max(0.001, SAMPLE_RATE / 4); // dramatically reduced
+    const forumSampleRate = Math.max(0.001, SAMPLE_RATE / 4);
     reason = (bettingPrefilter || nsfwPrefilter || hatePrefilter || SPAM_LINKS_REGEX.test(message.content)) ? 'keyword_matched' : (Math.random() < forumSampleRate ? 'sampled_forum' : 'skipped_by_sampling_forum');
   } else {
     reason = (bettingPrefilter || nsfwPrefilter || hatePrefilter || SPAM_LINKS_REGEX.test(message.content)) ? 'keyword_matched' : (Math.random() < SAMPLE_RATE ? 'sampled' : 'skipped_by_sampling');
@@ -1438,7 +1331,6 @@ client.on('messageCreate', async (message) => {
   try {
     let result = { flagged: false, category: 'OK' };
 
-    // use queue when concurrency is high
     if (activeCalls < CONCURRENCY) {
       activeCalls += 1;
       await logDetailed(guild, { ...baseLog, event: 'openai.call.start', reason: 'Starting OpenAI call', model: MODEL });
@@ -1463,21 +1355,13 @@ client.on('messageCreate', async (message) => {
 
       try { await sendDMWithRetries(message.author, { content: CONTENT_DELETED_MESSAGE.replace('{member}', `<@${message.author.id}>`) }); } catch (e) { await logDetailed(guild, { ...baseLog, action: 'dm_failed', note: e?.message || e }); }
 
-      // create strike
       try {
         await createStrike({ guildId: guild.id, userId: message.author.id, category: result.category, reason: 'auto-moderation - message flagged', messageId: message.id, actorId: 'bot' });
         const count = await countActiveStrikes(guild.id, message.author.id);
         await logDetailed(guild, { event: 'strike.recorded', authorId: message.author.id, note: `Strikes now ${count}` });
-        if (count >= PERM_MUTE_THRESHOLD) {
-          await muteMemberForever(message.member, `Reached ${count} strikes (permanent mute)`);
-        } else {
-          if (result.category === 'FLAG_HATE' || result.category === 'FLAG_NSFW') {
-            await muteMember(message.member, AUTO_MUTE_MINUTES * 3, `Auto-mute: ${result.category}`);
-          }
-        }
-      } catch (e) {
-        await logDetailed(guild, { event: 'strike.error', note: e?.message || e });
-      }
+        if (count >= PERM_MUTE_THRESHOLD) await muteMemberForever(message.member, `Reached ${count} strikes (permanent mute)`);
+        else if (result.category === 'FLAG_HATE' || result.category === 'FLAG_NSFW') await muteMember(message.member, AUTO_MUTE_MINUTES * 3, `Auto-mute: ${result.category}`);
+      } catch (e) { await logDetailed(guild, { event: 'strike.error', note: e?.message || e }); }
       return;
     } else {
       await logDetailed(guild, { ...baseLog, event: 'message.allowed', reason: 'Message allowed by moderation' });
