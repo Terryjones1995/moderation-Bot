@@ -8,6 +8,13 @@
  * - Defensive try/catch around showModal / deferReply / reply/editReply to avoid "Unknown interaction" / "already acknowledged"
  * - Improved betting detection and moderation prompt to reduce false positives (e.g. "alright bet")
  * - NEW: secondary OpenAI verification step for flagged messages to decide whether to record a strike
+ * - Updates per owner request:
+ *   * default account age -> 30 days
+ *   * admin user whitelist (won't be flagged/deleted)
+ *   * allow "nigga" usage (do not block); keep blocking "nigger"
+ *   * quarantined users may type but all messages go through OpenAI; do not auto-perm-mute them unless verification indicates severe offense
+ *   * lenient verification fallback: if verification unavailable, do NOT create a strike
+ *   * improved NBA/picks detection
  */
 
 import 'dotenv/config';
@@ -34,7 +41,12 @@ import { PrismaClient } from '@prisma/client';
 //
 // ---------- CONFIG ----------
 //
-const ACCOUNT_AGE_LIMIT_DAYS = parseInt(process.env.ACCOUNT_AGE_LIMIT_DAYS || '7', 10);
+
+// Default account age limit is now 30 days (was 7)
+const ACCOUNT_AGE_LIMIT_DAYS = parseInt(process.env.ACCOUNT_AGE_LIMIT_DAYS || '30', 10);
+
+// Admin user ID (exempt from moderation). You can override with env ADMIN_USER_ID.
+const ADMIN_USER_ID = process.env.ADMIN_USER_ID || '637758147330572349';
 
 const MOD_CATEGORY_NAME = process.env.MOD_CATEGORY_NAME || 'Moderation';
 const LOG_CHANNEL_NAME = process.env.LOG_CHANNEL_NAME || 'moderation-log';
@@ -91,12 +103,11 @@ Examples (input -> output):
 `;
 
 // ----- improved betting detection / affirmation handling -----
-
 // short single-word or short-phrase affirmations we should treat as "OK"
 const AFFIRMATION_REGEX = /^(?:bet|alright bet|bet!|bet\.*|bett+|bet rn|bet bro|bet fam|facts|ok|okie|yep|yup|ya|yah|betty)$/i;
 
 // high-signal betting keywords/phrases that strongly indicate betting activity (dm for picks, selling, parlay, bookie, etc.)
-const BETTING_SIGNAL_REGEX = /\b(?:dm\s+(?:for\s+)?picks|pm\s+(?:for\s+)?picks|dmme\s+for\s+picks|dm\s+for\s+pick|sell(?:ing)?\s+picks|picks\s+for\s+sale|parlay(?:s)?|sportsbook|bookie(?:s)?|parlaytip|parlay\s+tips|tipster|selling\s+picks|dm\s+for\s+picks)\b/i;
+const BETTING_SIGNAL_REGEX = /\b(?:dm\s+(?:for\s+)?picks|pm\s+(?:for\s+)?picks|dmme\s+for\s+picks|dm\s+for\s+pick|sell(?:ing)?\s+picks|picks\s+for\s+sale|parlay(?:s)?|sportsbook|bookie(?:s)?|parlaytip|parlay\s+tips|tipster|selling\s+picks|dm\s+for\s+picks|nba\s+picks|nba\s+pick|nbapicks|nba\s+parlay|mlb\s+picks|nba\s+parlays)\b/i;
 
 // betting numeric/odds patterns that indicate a real bet (amounts, money signs, odds, spreads)
 const BETTING_LIKELY_REGEX = /\b(?:\$\s?\d{1,6}(?:\.\d{1,2})?|\d{1,6}\s?(?:USD|usd|\$|€|£)|moneyline|ml|odds|spread|over|under|o\/u|parlay|vig|juice|\+\d{1,3}|\-\d{1,3})\b/;
@@ -108,8 +119,10 @@ const NSFW_REGEX = new RegExp(`\\b(${NSFW_KEYWORDS.map(k => k.replace(/[.*+?^${}
 
 const SPAM_LINKS_REGEX = /\bhttps?:\/\/\S+\b/i;
 
+// HATE_KEYWORDS: keep explicit slurs, but DO NOT include the "nigga" (with -a) variant per request.
+// We keep the hard -er form and other slurs that should still be blocked.
 const HATE_KEYWORDS = [
-  'nigger','nigga','chink','kike','spic','wetback','gook','raghead','honky','faggot','fag','coon','paki','sand nigger','slope'
+  'nigger','chink','kike','spic','wetback','gook','raghead','honky','faggot','fag','coon','paki','sand nigger','slope'
 ];
 const HATE_REGEX = new RegExp(`\\b(${HATE_KEYWORDS.map(k => k.replace(/[.*+?^${}()|[\\]\\\\]/g,'\\$&')).join('|')})\\b`, 'i');
 
@@ -265,12 +278,11 @@ async function performOpenAICall(content) {
  * After a message has been flagged by the classifier, ask OpenAI to decide if a formal strike should be recorded.
  * Returns { strike: boolean, reason: string }.
  *
- * Note: This consumes an additional OpenAI call; if rate-limited or OpenAI missing, we fall back to 'strike by default'
- * (safer for enforcement) but we annotate logs accordingly.
+ * Leniency change: if OpenAI is unavailable or rate-limited, we now fall back to NO_STRIKE (lenient).
  */
 async function verifyStrikeDecision(content, category) {
-  if (!openai) return { strike: true, reason: 'verification_unavailable_no_openai' };
-  if (!allowOpenAICall()) return { strike: true, reason: 'verification_unavailable_rate_limited' };
+  if (!openai) return { strike: false, reason: 'verification_unavailable_no_openai_lenient' };
+  if (!allowOpenAICall()) return { strike: false, reason: 'verification_unavailable_rate_limited_lenient' };
 
   const systemPrompt = `You are a moderation adjudicator. A classifier labeled a user message as "${category}". Your job: decide whether this message should generate a formal strike under typical community moderation rules. Consider severity, targeted insults, sexual explicitness, solicitations for paid picks, exchange of money, and repeated spam. Be conservative but protective of community safety.
 
@@ -305,7 +317,8 @@ ${content}
         raw = (r2.output?.[0]?.content?.[0]?.text || r2.output?.[0]?.content || '').trim();
       } catch (err2) {
         console.error('OpenAI verification both API attempts failed:', err2?.message || err2);
-        return { strike: true, reason: 'verification_failed_both_calls' };
+        // Lenient fallback: do not create strike if verification cannot run
+        return { strike: false, reason: 'verification_failed_both_calls_lenient' };
       }
     }
 
@@ -316,11 +329,12 @@ ${content}
 
     if (first.includes('STRIKE')) return { strike: true, reason: second };
     if (first.includes('NO_STRIKE')) return { strike: false, reason: second };
-    // if ambiguous, be conservative and strike
-    return { strike: true, reason: `ambiguous_verification_response: ${raw.slice(0,200)}` };
+    // if ambiguous, be lenient and do NOT strike
+    return { strike: false, reason: `ambiguous_verification_response_lenient: ${raw.slice(0,200)}` };
   } catch (err) {
     console.error('verifyStrikeDecision error', err?.message || err);
-    return { strike: true, reason: 'verification_exception' };
+    // Lenient fallback
+    return { strike: false, reason: 'verification_exception_lenient' };
   }
 }
 
@@ -358,37 +372,18 @@ async function decideAndApplyStrike(guild, message, category, baseLog = {}) {
         await logDetailed(guild, { event: 'strike.create_failed', note: e?.message || e, category });
       }
     } else {
-      // verification decided NO_STRIKE -> log and skip strike creation
+      // verification decided NO_STRIKE -> log and skip strike creation (lenient)
       await logDetailed(guild, {
         event: 'strike.skipped_by_verification',
         authorId: message.author.id,
         category,
         reason: verification.reason,
-        note: 'Message was flagged by classifier but verification step declined to escalate to a strike',
+        note: 'Message was flagged by classifier but verification step declined to escalate to a strike (lenient).',
       });
     }
   } catch (e) {
-    // In case verification flow itself fails unexpectedly, default to creating strike (safer)
-    await logDetailed(guild, { event: 'verification_flow_failed', note: e?.message || e, category });
-    try {
-      await createStrike({
-        guildId: guild.id,
-        userId: message.author.id,
-        category,
-        reason: 'auto-moderation - message flagged (verification failed; default strike)',
-        messageId: message.id,
-        actorId: 'bot',
-      });
-      const count = await countActiveStrikes(guild.id, message.author.id);
-      await logDetailed(guild, { event: 'strike.recorded', authorId: message.author.id, note: `Strikes now ${count}`, category });
-      if (count >= PERM_MUTE_THRESHOLD) {
-        await muteMemberForever(message.member, `Reached ${count} strikes (permanent mute)`);
-      } else if (category === 'FLAG_HATE' || category === 'FLAG_NSFW') {
-        await muteMember(message.member, AUTO_MUTE_MINUTES * 3, `Auto-mute: ${category}`);
-      }
-    } catch (err2) {
-      await logDetailed(guild, { event: 'strike.create_failed_after_verif_err', note: err2?.message || err2 });
-    }
+    // On unexpected error: be lenient (do not auto-strike), but log the failure.
+    await logDetailed(guild, { event: 'verification_flow_failed_lenient', note: e?.message || e, category });
   }
 }
 
@@ -1396,6 +1391,12 @@ client.on('messageCreate', async (message) => {
   if (!message.guild || message.author.bot) return;
   const guild = message.guild;
 
+  // Admin whitelist: skip moderation entirely for admin user (allowed to post anything)
+  if (String(message.author.id) === String(ADMIN_USER_ID)) {
+    await logDetailed(guild, { event: 'message.bypass_admin', messageId: message.id, authorId: message.author.id, authorTag: message.author.tag, channelId: message.channel.id, channelName: message.channel.name || '(unknown)', content: safeTruncate(message.content || '', 400) });
+    return;
+  }
+
   if (!logChannels.has(guild.id)) await setupGuild(guild).catch(()=>{});
 
   const quarantinedRole = guild.roles.cache.find((r) => r.name === QUARANTINED_ROLE_NAME);
@@ -1416,6 +1417,8 @@ client.on('messageCreate', async (message) => {
 
   await logDetailed(guild, { ...baseLog, event: 'message.received', note: 'message received' });
 
+  // If user is quarantined: messages are allowed to be posted but we MUST run OpenAI check on them.
+  // If flagged -> delete message. For strikes: use verification (lenient default). We DO NOT auto-perm-mute in quarantine by default.
   if (isQuarantined) {
     const ts = getQuarantineTimestamp(guild.id, message.author.id) || Date.now();
     const age = Date.now() - ts;
@@ -1427,12 +1430,11 @@ client.on('messageCreate', async (message) => {
       if (cached !== null) {
         if (cached.flagged) {
           try { await message.delete(); } catch (e) { await logDetailed(guild, { ...baseLog, action: 'delete_failed', note: e?.message || e }); }
-          // run verification before creating a strike
+          // run verification before creating a strike (decideAndApplyStrike uses lenient fallback)
           await decideAndApplyStrike(guild, message, cached.category, { ...baseLog, event: 'quarantine.auto_flag_cache' });
           await logDetailed(guild, { ...baseLog, action: 'deleted', reason: `cache_${cached.category}`, category: cached.category });
           try { await message.author.send({ content: `We suspect your account is a bot or violating rules and have taken action: ${cached.category}` }); } catch {}
-          // keep permanent mute for quarantine auto-flagging (policy)
-          await muteMemberForever(message.member, 'Quarantine: flagged by OpenAI');
+          // Do NOT permanently mute by default for quarantine auto-flagging; strikes are applied only if verification decides so.
         }
       } else {
         if (allowOpenAICall()) {
@@ -1444,7 +1446,7 @@ client.on('messageCreate', async (message) => {
               await decideAndApplyStrike(guild, message, res.category, { ...baseLog, event: 'quarantine.auto_flag_openai' });
               await logDetailed(guild, { ...baseLog, action: 'deleted', reason: res.category, category: res.category, note: 'Deleted flagged message by AI during quarantine' });
               try { await message.author.send({ content: `We suspect your account is a bot or violating rules and have taken action: ${res.category}` }); } catch {}
-              await muteMemberForever(message.member, 'Quarantine: flagged by OpenAI');
+              // Do NOT permanently mute by default for quarantine auto-flagging; verification decides strikes.
             }
           } catch (e) {
             await logDetailed(guild, { ...baseLog, event: 'quarantine.openai_error', note: e?.message || e });
@@ -1469,6 +1471,7 @@ client.on('messageCreate', async (message) => {
   const isForumChannel = ch.type === ChannelType.GuildForum;
   const isThread = typeof ch.isThread === 'function' ? ch.isThread() : (ch.type === ChannelType.PublicThread || ch.type === ChannelType.PrivateThread || ch.type === ChannelType.AnnouncementThread);
 
+  // Spam/flood detection (unchanged): delete & immediate strike
   if (!isForumChannel && !isThread) {
     const arr = addRecentMessage(guild.id, message.author.id, message.content || '<embed/attachment>');
     if (checkSpam(arr)) {
