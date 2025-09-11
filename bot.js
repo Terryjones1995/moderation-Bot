@@ -8,13 +8,16 @@
  * - Defensive try/catch around showModal / deferReply / reply/editReply to avoid "Unknown interaction" / "already acknowledged"
  * - Improved betting detection and moderation prompt to reduce false positives (e.g. "alright bet")
  * - NEW: secondary OpenAI verification step for flagged messages to decide whether to record a strike
- * - Updates per owner request:
+ * - Updates per owner requests:
  *   * default account age -> 30 days
  *   * admin user whitelist (won't be flagged/deleted)
  *   * allow "nigga" usage (do not block); keep blocking "nigger"
  *   * quarantined users may type but all messages go through OpenAI; do not auto-perm-mute them unless verification indicates severe offense
  *   * lenient verification fallback: if verification unavailable, do NOT create a strike
  *   * improved NBA/picks detection
+ *   * matchmaking channel enforcement for specific channel (only certain prefixes allowed)
+ *   * advertising channel bypass (allow adverts in specific channel)
+ *   * strike system made less harsh via explicit hate allowlist and reduced immediate strikes in allowed channels
  */
 
 import 'dotenv/config';
@@ -119,12 +122,36 @@ const NSFW_REGEX = new RegExp(`\\b(${NSFW_KEYWORDS.map(k => k.replace(/[.*+?^${}
 
 const SPAM_LINKS_REGEX = /\bhttps?:\/\/\S+\b/i;
 
-// HATE_KEYWORDS: keep explicit slurs, but DO NOT include the "nigga" (with -a) variant per request.
-// We keep the hard -er form and other slurs that should still be blocked.
+// HATE_KEYWORDS: keep explicit slurs that we must block (the most severe forms). Per prior request, "nigga" is intentionally NOT included.
+// This list is intentionally conservative to avoid overblocking. Add only clearly offensive slurs to this list.
 const HATE_KEYWORDS = [
-  'nigger','chink','kike','spic','wetback','gook','raghead','honky','faggot','fag','coon','paki','sand nigger','slope'
+  'nigger','chink','kike','spic','wetback','gook','raghead','honky','faggot','fag','coon','paki'
 ];
 const HATE_REGEX = new RegExp(`\\b(${HATE_KEYWORDS.map(k => k.replace(/[.*+?^${}()|[\\]\\\\]/g,'\\$&')).join('|')})\\b`, 'i');
+
+// words we explicitly allow even if the classifier returns FLAG_HATE (to make the strike system less harsh)
+// e.g., "nigga" usage is allowed per your request; "sweats" or similar gamer slang should not generate strikes.
+// These are lowercased and used to reduce false positives for FLAG_HATE responses.
+const HATE_ALLOWLIST = ['nigga', 'sweats', 'sweat', 'sweaties', 'sweaty'];
+
+//
+// ---------- MATCHMAKING CHANNEL CONFIG ----------
+//
+// Channel to enforce strict matchmaking message format (user requested)
+const MATCH_CHANNEL_ID = process.env.MATCH_CHANNEL_ID || '1031429142538895380';
+
+// Allowed prefix regex: starts with "code", "codes", "code?", "5." or "5 " or a single-letter "s" optionally followed by punctuation/space
+const MATCH_ALLOWED_PREFIX_REGEX = /^\s*(?:code(?:s)?\b|code\?|5(?:\.|\b)|s(?:\.|\b))/i;
+
+// Lightweight heuristic to detect messages that are clearly matchmaking-related even if they don't start with the allowed prefixes
+// e.g., "LF5", "Looking for 5v5", "need 4 more", "5v5", "need 4"
+const MATCH_HEURISTIC_REGEX = /\b(?:lf5|lfg|looking for 5v5|looking for 5|looking for players|looking for a team|need\s+\d+\s+(?:more\s+)?(?:players|people|people)|need\s+\d+\b|need\s+\d+\s+more|5v5|5v5s|team\s+of\s+5|need\s+4|need\s+3|need\s+2|need\s+1|need\s+4\s+more|want\s+5v5)\b/i;
+
+//
+// ---------- ADVERTISING CHANNEL CONFIG ----------
+//
+// Channel where advertising/league promotions are explicitly allowed (bypass moderation)
+const AD_CHANNEL_ID = process.env.AD_CHANNEL_ID || '1120271059262906368';
 
 //
 // ---------- ENV & CLIENT ----------
@@ -342,6 +369,8 @@ ${content}
  * decideAndApplyStrike:
  * Given a flagged message, run verification and conditionally create an entry/penalty.
  * This centralizes the behavior so we consistently apply verification for all OpenAI-flagged messages.
+ *
+ * IMPORTANT: We are lenient: verification must explicitly return STRIKE to create a strike.
  */
 async function decideAndApplyStrike(guild, message, category, baseLog = {}) {
   try {
@@ -389,7 +418,7 @@ async function decideAndApplyStrike(guild, message, category, baseLog = {}) {
 
 /**
  * shouldCheckByPolicy
- * - Uses deterministic heuristics first (affirmation guard, high-signal phrases, numeric money/odds patterns)
+ * - Uses deterministic heuristics first (affirmation guard, high-signal phrases, numeric checks)
  * - Always check for explicit NSFW/HATE
  * - Sampling fallback for everything else (reduced in forum channels)
  */
@@ -1417,6 +1446,70 @@ client.on('messageCreate', async (message) => {
 
   await logDetailed(guild, { ...baseLog, event: 'message.received', note: 'message received' });
 
+  // AD CHANNEL BYPASS: allow advertising/league posts in configured ad channel
+  try {
+    if (String(message.channel.id) === String(AD_CHANNEL_ID)) {
+      await logDetailed(guild, { ...baseLog, event: 'ad_channel.allowed', note: `Advertising allowed in channel ${AD_CHANNEL_ID}; skipping moderation.` });
+      return; // full bypass: allow adverts and promotions in this channel
+    }
+  } catch (e) {
+    await logDetailed(guild, { ...baseLog, event: 'ad_channel_handler_failed', note: e?.message || e });
+  }
+
+  //
+  // Special-case: matchmaking channel strict formatting & deletion
+  //
+  try {
+    if (String(message.channel.id) === String(MATCH_CHANNEL_ID)) {
+      // Allow moderators / server managers to post freely
+      const modRole = guild.roles.cache.find(r => r.name === MODERATOR_ROLE_NAME);
+      const isMod = modRole ? (message.member && message.member.roles.cache.has(modRole.id)) : false;
+      const isServerManager = message.member && message.member.permissions && message.member.permissions.has(PermissionsBitField.Flags.ManageGuild);
+      if (isMod || isServerManager || String(message.author.id) === String(ADMIN_USER_ID)) {
+        await logDetailed(guild, { ...baseLog, event: 'match_channel.bypass_mod', note: 'Moderator/manager/admin posted in matchmaking channel' });
+        // allow
+      } else {
+        const txt = (message.content || '').trim();
+        // 1) allowed prefix: starts with code/codes/code? or 5. or s.
+        if (MATCH_ALLOWED_PREFIX_REGEX.test(txt)) {
+          await logDetailed(guild, { ...baseLog, event: 'match_channel.allowed', note: 'Starts with allowed matchmaking prefix (code / 5 / s)' });
+          // allow
+        } else {
+          // 2) try heuristic: LF5 / LFG / 5v5 / need X more etc.
+          if (MATCH_HEURISTIC_REGEX.test(txt)) {
+            await logDetailed(guild, { ...baseLog, event: 'match_channel.allowed_heuristic', note: 'Heuristic considered this matchmaking content' });
+            // allow
+          } else {
+            // Not clearly a matchmaking post -> delete the message and DM the user
+            try {
+              await message.delete();
+              await logDetailed(guild, { ...baseLog, action: 'deleted', reason: 'match_channel.non_matchmaking', note: 'Deleted non-matchmaking post in matchmaking channel' });
+            } catch (e) {
+              await logDetailed(guild, { ...baseLog, action: 'delete_failed', note: e?.message || e });
+            }
+            try {
+              await sendDMWithRetries(message.author, {
+                content:
+`Hi <@${message.author.id}>, your message in the 5v5 matchmaking channel was removed.
+This channel is reserved for 5v5 matchup posts. Please start messages with one of these formats:
+• \`Code\`, \`codes\`, or \`code?\` followed by the lobby code
+• \`5.\` or starting with \`5\`
+• \`s\` (single-letter prefix like \`s.\`)
+Or clearly state you're looking for a 5v5 (examples: "LF5", "Looking for 5v5", "Need 4 more"). If you believe this was removed in error, contact a moderator.`
+              });
+            } catch (e) {
+              await logDetailed(guild, { ...baseLog, event: 'dm_failed', note: e?.message || e });
+            }
+            return; // don't continue other moderation for this deleted message
+          }
+        }
+      }
+    }
+  } catch (e) {
+    await logDetailed(guild, { ...baseLog, event: 'match_channel_handler_failed', note: e?.message || e });
+    // fallthrough to regular moderation if match channel handler errors
+  }
+
   // If user is quarantined: messages are allowed to be posted but we MUST run OpenAI check on them.
   // If flagged -> delete message. For strikes: use verification (lenient default). We DO NOT auto-perm-mute in quarantine by default.
   if (isQuarantined) {
@@ -1428,6 +1521,18 @@ client.on('messageCreate', async (message) => {
       await logDetailed(guild, { ...baseLog, event: 'quarantine.monitor', reason: 'Monitoring quarantined user message (72h window)' });
       const cached = cacheGet(message.content || '');
       if (cached !== null) {
+        // If cache says hate but only allowlisted words present -> treat OK
+        if (cached.flagged && cached.category === 'FLAG_HATE') {
+          const low = (message.content || '').toLowerCase();
+          const hasAllow = HATE_ALLOWLIST.some(w => low.includes(w));
+          const hasSevere = HATE_REGEX.test(low);
+          if (hasAllow && !hasSevere) {
+            await logDetailed(guild, { ...baseLog, event: 'hate_allowlist_quarantine', note: 'Message contained allowlisted words; not enforcing hate flag' });
+            // do nothing
+            return;
+          }
+        }
+
         if (cached.flagged) {
           try { await message.delete(); } catch (e) { await logDetailed(guild, { ...baseLog, action: 'delete_failed', note: e?.message || e }); }
           // run verification before creating a strike (decideAndApplyStrike uses lenient fallback)
@@ -1441,12 +1546,24 @@ client.on('messageCreate', async (message) => {
           try {
             const res = await performOpenAICall(message.content || '');
             await logDetailed(guild, { ...baseLog, event: 'openai.call.end', reason: 'Quarantine monitoring', resultCategory: res.category });
+
+            // Hate allowlist check for quarantine
+            if (res.flagged && res.category === 'FLAG_HATE') {
+              const low = (message.content || '').toLowerCase();
+              const hasAllow = HATE_ALLOWLIST.some(w => low.includes(w));
+              const hasSevere = HATE_REGEX.test(low);
+              if (hasAllow && !hasSevere) {
+                await logDetailed(guild, { ...baseLog, event: 'hate_allowlist_quarantine', note: 'OpenAI flagged hate but message contains allowlisted words only; skipping enforcement' });
+                // treat as OK (do nothing further)
+                return;
+              }
+            }
+
             if (res.flagged) {
               try { await message.delete(); } catch (e) { await logDetailed(guild, { ...baseLog, action: 'delete_failed', note: e?.message || e }); }
               await decideAndApplyStrike(guild, message, res.category, { ...baseLog, event: 'quarantine.auto_flag_openai' });
               await logDetailed(guild, { ...baseLog, action: 'deleted', reason: res.category, category: res.category, note: 'Deleted flagged message by AI during quarantine' });
               try { await message.author.send({ content: `We suspect your account is a bot or violating rules and have taken action: ${res.category}` }); } catch {}
-              // Do NOT permanently mute by default for quarantine auto-flagging; verification decides strikes.
             }
           } catch (e) {
             await logDetailed(guild, { ...baseLog, event: 'quarantine.openai_error', note: e?.message || e });
@@ -1471,7 +1588,8 @@ client.on('messageCreate', async (message) => {
   const isForumChannel = ch.type === ChannelType.GuildForum;
   const isThread = typeof ch.isThread === 'function' ? ch.isThread() : (ch.type === ChannelType.PublicThread || ch.type === ChannelType.PrivateThread || ch.type === ChannelType.AnnouncementThread);
 
-  // Spam/flood detection (unchanged): delete & immediate strike
+  // Spam/flood detection: delete & immediate mute; create strike only if NOT in ad channel (we already bypass AD_CHANNEL at top),
+  // and still keep behavior strict for real spam (multiple repeats). This avoids striking promotional posts in AD channel.
   if (!isForumChannel && !isThread) {
     const arr = addRecentMessage(guild.id, message.author.id, message.content || '<embed/attachment>');
     if (checkSpam(arr)) {
@@ -1481,6 +1599,7 @@ client.on('messageCreate', async (message) => {
 
       try {
         // spam detection uses deterministic heuristics -> apply strike immediately (no verification)
+        // However: be cautious and only create strike in normal channels (ad channel bypass handled earlier)
         await createStrike({ guildId: guild.id, userId: message.author.id, category: 'FLAG_SPAM', reason: 'spam_detection', messageId: message.id, actorId: 'bot' });
         const count = await countActiveStrikes(guild.id, message.author.id);
         await logDetailed(guild, { event: 'strike.recorded', authorId: message.author.id, note: `Strikes now ${count}` });
@@ -1500,10 +1619,22 @@ client.on('messageCreate', async (message) => {
   const cached = cacheGet(message.content || '');
   if (cached !== null) {
     await logDetailed(guild, { ...baseLog, event: 'cache.hit', reason: 'cache hit', category: cached.category, flagged: cached.flagged });
+
+    // If cache reasons indicate hate but content is in allowlist only -> do not delete
+    if (cached.flagged && cached.category === 'FLAG_HATE') {
+      const low = (message.content || '').toLowerCase();
+      const hasAllow = HATE_ALLOWLIST.some(w => low.includes(w));
+      const hasSevere = HATE_REGEX.test(low);
+      if (hasAllow && !hasSevere) {
+        await logDetailed(guild, { ...baseLog, event: 'hate_allowlist_cache', note: 'Cached hate flag but message contains allowlisted words only; skipping delete' });
+        return;
+      }
+    }
+
     if (cached.flagged) {
       try { await message.delete(); await logDetailed(guild, { ...baseLog, action: 'deleted', reason: `cache_${cached.category}`, category: cached.category }); } catch (e) { await logDetailed(guild, { ...baseLog, action: 'delete_failed', note: e?.message || e }); }
       try { await sendDMWithRetries(message.author, { content: CONTENT_DELETED_MESSAGE.replace('{member}', `<@${message.author.id}>`) }); } catch (e) { await logDetailed(guild, { ...baseLog, action: 'dm_failed', note: e?.message || e }); }
-      // decide whether to apply strike based on verification
+      // decide whether to apply strike based on verification (lenient fallback)
       await decideAndApplyStrike(guild, message, cached.category, { ...baseLog, event: 'cache.flagged' });
     }
     return;
@@ -1543,6 +1674,19 @@ client.on('messageCreate', async (message) => {
       await logDetailed(guild, { ...baseLog, event: 'openai.enqueue_result', reason: 'Enqueue result', resultCategory: result.category });
     }
 
+    // Apply hate allowlist safeguard: if classifier says FLAG_HATE but message contains only allowlisted tokens and no severe slur -> treat as OK
+    if (result.flagged && result.category === 'FLAG_HATE') {
+      const low = (message.content || '').toLowerCase();
+      const hasAllow = HATE_ALLOWLIST.some(w => low.includes(w));
+      const hasSevere = HATE_REGEX.test(low);
+      if (hasAllow && !hasSevere) {
+        await logDetailed(guild, { ...baseLog, event: 'hate_allowlist', note: 'OpenAI flagged hate but message contains allowlisted words only; downgrading to OK' });
+        // treat as OK
+        result.flagged = false;
+        result.category = 'OK';
+      }
+    }
+
     if (result.flagged) {
       try {
         await message.delete();
@@ -1551,7 +1695,7 @@ client.on('messageCreate', async (message) => {
 
       try { await sendDMWithRetries(message.author, { content: CONTENT_DELETED_MESSAGE.replace('{member}', `<@${message.author.id}>`) }); } catch (e) { await logDetailed(guild, { ...baseLog, action: 'dm_failed', note: e?.message || e }); }
 
-      // NEW: verify with OpenAI whether to record a strike for this flagged message
+      // NEW: verify with OpenAI whether to record a strike for this flagged message (lenient default)
       await decideAndApplyStrike(guild, message, result.category, { ...baseLog, event: 'auto_flag_openai' });
 
       return;
