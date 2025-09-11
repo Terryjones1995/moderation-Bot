@@ -73,6 +73,15 @@ Please note that new Discord accounts (less than ${ACCOUNT_AGE_LIMIT_DAYS} days 
 const ACCOUNT_TOO_NEW_MESSAGE = `Hi {member}, your Discord account is under ${ACCOUNT_AGE_LIMIT_DAYS} days old and cannot send messages here yet. Your message was removed.`;
 const CONTENT_DELETED_MESSAGE = `Hi {member}, your recent message was removed because it violated our community guidelines (hate, gambling, NSFW, or spam).`;
 
+const MOD_CHANNEL_DM_TEXT = (channelHint) => `Hi <@{user}>, your message was removed from ${channelHint} because it didn't match the required format for that channel. Please follow the pinned rules or ask a moderator if you're unsure.`;
+
+const MATCH_CHANNEL_DM_TEXT = (userId) => `Hi <@${userId}>, your message in the 5v5 matchmaking channel was removed.
+This channel is reserved for 5v5 matchup posts. Please start messages with one of these formats:
+• \`Code\`, \`codes\`, or \`code?\` followed by the lobby code
+• \`5.\` or starting with \`5\`
+• \`s\` (single-letter prefix like \`s.\`)
+Or clearly state you're looking for a 5v5 (examples: "LF5", "Looking for 5v5", "Need 4 more"). If you believe this was removed in error, contact a moderator.`;
+
 /**
  * Improved moderation system prompt:
  * - precise, conservative instructions
@@ -131,27 +140,29 @@ const HATE_REGEX = new RegExp(`\\b(${HATE_KEYWORDS.map(k => k.replace(/[.*+?^${}
 
 // words we explicitly allow even if the classifier returns FLAG_HATE (to make the strike system less harsh)
 // e.g., "nigga" usage is allowed per your request; "sweats" or similar gamer slang should not generate strikes.
-// These are lowercased and used to reduce false positives for FLAG_HATE responses.
 const HATE_ALLOWLIST = ['nigga', 'sweats', 'sweat', 'sweaties', 'sweaty'];
 
 //
 // ---------- MATCHMAKING CHANNEL CONFIG ----------
 //
-// Channel to enforce strict matchmaking message format (user requested)
 const MATCH_CHANNEL_ID = process.env.MATCH_CHANNEL_ID || '1031429142538895380';
 
 // Allowed prefix regex: starts with "code", "codes", "code?", "5." or "5 " or a single-letter "s" optionally followed by punctuation/space
 const MATCH_ALLOWED_PREFIX_REGEX = /^\s*(?:code(?:s)?\b|code\?|5(?:\.|\b)|s(?:\.|\b))/i;
 
 // Lightweight heuristic to detect messages that are clearly matchmaking-related even if they don't start with the allowed prefixes
-// e.g., "LF5", "Looking for 5v5", "need 4 more", "5v5", "need 4"
 const MATCH_HEURISTIC_REGEX = /\b(?:lf5|lfg|looking for 5v5|looking for 5|looking for players|looking for a team|need\s+\d+\s+(?:more\s+)?(?:players|people|people)|need\s+\d+\b|need\s+\d+\s+more|5v5|5v5s|team\s+of\s+5|need\s+4|need\s+3|need\s+2|need\s+1|need\s+4\s+more|want\s+5v5)\b/i;
 
 //
 // ---------- ADVERTISING CHANNEL CONFIG ----------
 //
-// Channel where advertising/league promotions are explicitly allowed (bypass moderation)
 const AD_CHANNEL_ID = process.env.AD_CHANNEL_ID || '1120271059262906368';
+
+//
+// ---------- CREW RECRUITMENT PROHIBITION CONFIG ----------
+//
+const CREW_RECRUIT_CHANNEL_ID = process.env.CREW_RECRUIT_CHANNEL_ID || '726336850385698857';
+const CREW_RECRUIT_REGEX = /\b(?:crew|crew members|looking for crew|looking for grinders|join my crew|join our crew|crew recruiting|recruiting crew|recruiting for my crew)\b/i;
 
 //
 // ---------- ENV & CLIENT ----------
@@ -1457,6 +1468,37 @@ client.on('messageCreate', async (message) => {
   }
 
   //
+  // CREW RECRUIT CHANNEL: delete crew recruiting messages and DM the user
+  //
+  try {
+    if (String(message.channel.id) === String(CREW_RECRUIT_CHANNEL_ID)) {
+      // Admin/mod bypass
+      const modRole = guild.roles.cache.find(r => r.name === MODERATOR_ROLE_NAME);
+      const isMod = modRole ? (message.member && message.member.roles.cache.has(modRole.id)) : false;
+      if (isMod || String(message.author.id) === String(ADMIN_USER_ID)) {
+        await logDetailed(guild, { ...baseLog, event: 'crew_channel.bypass', note: 'Moderator/admin posted in crew channel' });
+        // allow
+      } else {
+        const txt = (message.content || '').trim();
+        if (CREW_RECRUIT_REGEX.test(txt)) {
+          try {
+            await message.delete();
+            await logDetailed(guild, { ...baseLog, action: 'deleted', reason: 'crew_recruiting_prohibited', note: 'Deleted crew recruiting post' });
+          } catch (e) {
+            await logDetailed(guild, { ...baseLog, action: 'delete_failed', note: e?.message || e });
+          }
+          try {
+            await sendDMWithRetries(message.author, { content: `Hi <@${message.author.id}>, crew recruitment is not allowed in <#${CREW_RECRUIT_CHANNEL_ID}>. Please use the designated recruitment channels or ask a moderator.` });
+          } catch (e) { await logDetailed(guild, { ...baseLog, event: 'dm_failed', note: e?.message || e }); }
+          return;
+        }
+      }
+    }
+  } catch (e) {
+    await logDetailed(guild, { ...baseLog, event: 'crew_channel_handler_failed', note: e?.message || e });
+  }
+
+  //
   // Special-case: matchmaking channel strict formatting & deletion
   //
   try {
@@ -1467,18 +1509,18 @@ client.on('messageCreate', async (message) => {
       const isServerManager = message.member && message.member.permissions && message.member.permissions.has(PermissionsBitField.Flags.ManageGuild);
       if (isMod || isServerManager || String(message.author.id) === String(ADMIN_USER_ID)) {
         await logDetailed(guild, { ...baseLog, event: 'match_channel.bypass_mod', note: 'Moderator/manager/admin posted in matchmaking channel' });
-        // allow
+        // allow, continue to normal moderation pipeline
       } else {
         const txt = (message.content || '').trim();
         // 1) allowed prefix: starts with code/codes/code? or 5. or s.
         if (MATCH_ALLOWED_PREFIX_REGEX.test(txt)) {
           await logDetailed(guild, { ...baseLog, event: 'match_channel.allowed', note: 'Starts with allowed matchmaking prefix (code / 5 / s)' });
-          // allow
+          // allowed — continue to regular moderation checks (we do not short-circuit OpenAI verification)
         } else {
           // 2) try heuristic: LF5 / LFG / 5v5 / need X more etc.
           if (MATCH_HEURISTIC_REGEX.test(txt)) {
             await logDetailed(guild, { ...baseLog, event: 'match_channel.allowed_heuristic', note: 'Heuristic considered this matchmaking content' });
-            // allow
+            // allowed — continue to regular moderation checks
           } else {
             // Not clearly a matchmaking post -> delete the message and DM the user
             try {
@@ -1489,13 +1531,7 @@ client.on('messageCreate', async (message) => {
             }
             try {
               await sendDMWithRetries(message.author, {
-                content:
-`Hi <@${message.author.id}>, your message in the 5v5 matchmaking channel was removed.
-This channel is reserved for 5v5 matchup posts. Please start messages with one of these formats:
-• \`Code\`, \`codes\`, or \`code?\` followed by the lobby code
-• \`5.\` or starting with \`5\`
-• \`s\` (single-letter prefix like \`s.\`)
-Or clearly state you're looking for a 5v5 (examples: "LF5", "Looking for 5v5", "Need 4 more"). If you believe this was removed in error, contact a moderator.`
+                content: MATCH_CHANNEL_DM_TEXT(message.author.id)
               });
             } catch (e) {
               await logDetailed(guild, { ...baseLog, event: 'dm_failed', note: e?.message || e });
